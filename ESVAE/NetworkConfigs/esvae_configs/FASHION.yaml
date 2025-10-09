@@ -1,15 +1,17 @@
 Network:
-  epochs: 300
-  batch_size: 128 # 256
+  epochs: 200
+  batch_size: 256 # 256
   sample_batch_size: 256
   n_steps: 16 # timestep
   dataset: "FashionMNIST"
   in_channels: 1
-  data_path: "/data/zhan/CV_data/FashionMNIST"
-  lr: 0.00005
+  data_path: "/home/user/kpm/data/fashion-mnist-master/data/fashion" # "/data/zhan/CV_data/FashionMNIST"
+  lr: 0.0001 # 0.00005
   sample_layer_lr_times: 10
   n_class: 10
-  latent_dim: 32
+#  latent_dim: 32 # 128
+  latent_dim_recon: 32  # 重构任务的潜在维度
+  latent_dim_class: 512    # 分类任务的潜在维度
   input_size: 32
   model: "SAE" # "ESVAE" # ESVAE or ESVAE_large
   k: 20 # multiplier of channel

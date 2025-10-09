@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="SshConfigs">
+    <configs>
+      <sshConfig authType="PASSWORD" connectionConfig="{&quot;serverAliveInterval&quot;:300}" host="10.8.135.1" id="f5705cc2-ff39-4d92-8140-2cb79263101f" port="57827" customName="root@10.8.135.1:57827(3090)" nameFormat="CUSTOM" username="root" useOpenSSHConfig="true">
+        <option name="customName" value="root@10.8.135.1:57827(3090)" />
+      </sshConfig>
+      <sshConfig authType="PASSWORD" connectionConfig="{&quot;serverAliveInterval&quot;:300}" host="10.8.135.1" id="45112eb3-d697-489f-9ccf-96d49b5ef3e2" port="55885" customName="3090-55885" nameFormat="CUSTOM" username="root" useOpenSSHConfig="true">
+        <option name="customName" value="3090-55885" />
+      </sshConfig>
+    </configs>
+  </component>
+</project>

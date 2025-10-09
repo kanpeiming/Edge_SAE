@@ -21,6 +21,8 @@ from utils import CountMulAddSNN
 import svae_models.edge_sae as edge_sae
 from svae_models.snn_layers import LIFSpike
 
+
+
 # 三个评价指标不再需要
 # import metrics.inception_score as inception_score
 # import metrics.clean_fid as clean_fid
@@ -68,6 +70,8 @@ def train(network, trainloader, opti, epoch):
     # dist_meter = AverageMeter()
 
     boundary_meter = AverageMeter()  # 新增 Boundary Loss 记录器
+    classification_meter = AverageMeter()  # 新增分类准确率记录器
+    classification_loss_meter = AverageMeter()  # 分类损失记录器
 
     # l2_meter = AverageMeter()   # 新增L2 Loss 记录器
 
@@ -77,8 +81,8 @@ def train(network, trainloader, opti, epoch):
 
     # 初始化边缘提取模块
     edge_extractor = CannyEdgeDetectionModule(device=network.module.device,
-                                               in_channels=glv.network_config['in_channels'])
-    # edge_extractor = EdgeExtractionModule(device=network.device, in_channels=glv.network_config['in_channels'])
+                                              in_channels=glv.network_config['in_channels'])
+    # edge_extractor = SobelEdgeExtractionModule(device=network.module.device, in_channels=glv.network_config['in_channels'])
 
     scaler = GradScaler()  # 初始化 GradScaler
 
@@ -102,7 +106,7 @@ def train(network, trainloader, opti, epoch):
         spike_input = real_img.unsqueeze(-1).repeat(1, 1, 1, 1, n_steps).to(init_device)  # 确保输入张量在正确的设备上
         # spike_input = real_img.unsqueeze(-1).repeat(1, 1, 1, 1, n_steps)  # (N, C, H, W, T)
 
-        with torch.amp.autocast('cuda'):  # 使用 autocast 进行混合精度
+        with torch.cuda.amp.autocast():  # 使用 autocast 进行混合精度
             # 只保留x_recon，去掉r_q, r_p的计算
             # x_recon, _, _, sampled_z_q = network.module(spike_input, scheduled=glv.network_config['scheduled'])
             # losses = network.module.loss_function_mmd(edge_img, x_recon)  # 不需要r_q和r_p了
@@ -110,8 +114,8 @@ def train(network, trainloader, opti, epoch):
             # x_recon, _, _, _ = network.module(spike_input, scheduled=glv.network_config['scheduled'])
             # losses = network.module.loss_function(edge_img, x_recon)
             # 修改后
-            x_recon, latent = network.module(spike_input, scheduled=glv.network_config['scheduled'])
-            losses = network.module.loss_function(edge_img, x_recon)
+            x_recon, logits = network.module(spike_input, labels, scheduled=glv.network_config['scheduled'])
+            losses = network.module.loss_function(edge_img, x_recon, logits, labels, epoch=epoch)
             loss = losses['loss']
 
         # 检查 loss 是否包含 NaN
@@ -133,6 +137,7 @@ def train(network, trainloader, opti, epoch):
             losses['EdgeReconstruction_Loss'].detach().cpu().item())  # Reconstruction_Loss --> Edge reconstruction loss
         # dist_meter.update(losses['Distance_Loss'].detach().cpu().item())
         boundary_meter.update(losses['Boundary_Loss'].detach().cpu().item())  # 更新 Boundary Loss
+        classification_loss_meter.update(losses['Classification_Loss'].detach().cpu().item())
         # l2_meter.update(losses['L2_Loss'].detach().cpu().item())   # 更新 L2 Loss
 
         # mean_r_q = (r_q.mean(0).detach().cpu() + batch_idx * mean_r_q) / (batch_idx + 1)  # (latent_dim)
@@ -140,30 +145,37 @@ def train(network, trainloader, opti, epoch):
         # mean_sampled_z_q = (sampled_z_q.mean(0).detach().cpu() + batch_idx * mean_sampled_z_q) / (
         #         batch_idx + 1)  # (C,T)
 
+        # 计算分类准确率
+        _, predicted = torch.max(logits, 1)
+        correct = (predicted == labels).sum().item()
+        accuracy = correct / labels.size(0)
+        classification_meter.update(accuracy)
+
         print(
-            f'Train[{epoch}/{max_epoch}] [{batch_idx}/{len(trainloader)}] Loss: {loss_meter.avg}, RECONS: {recons_meter.avg}, BOUNDARY: {boundary_meter.avg}')  # 新增, SSIM: {ssim_meter.avg:.7f}
+            f'Train[{epoch}/{max_epoch}] [{batch_idx}/{len(trainloader)}] Loss: {loss_meter.avg},'
+            f' RECONS: {recons_meter.avg} \n BOUNDARY: {boundary_meter.avg}, Classification_Loss: {classification_loss_meter.avg} ACC: {classification_meter.avg}')
 
         # 在第一轮时保存重构图像和边缘图像
         # 在第一轮和最后一轮，且是第一个批次时保存图像
-        if (epoch == 0 or epoch == max_epoch - 1) and batch_idx == 0:  #
+        if (epoch % 10 == 0) and batch_idx == 0:  #
             os.makedirs(f'{args.project_save_path}/checkpoint/{dataset_name}/{args.name}/imgs/train/', exist_ok=True)
 
-            # 保存原始输入图像
+        # 保存原始输入图像
             torchvision.utils.save_image((real_img + 1) / 2,
-                                         f'{args.project_save_path}/checkpoint/{dataset_name}/{args.name}/imgs/train/epoch{epoch}_input.png')
+                                     f'{args.project_save_path}/checkpoint/{dataset_name}/{args.name}/imgs/train/epoch{epoch}_input.png')
 
-            # 保存解码后的重构图像
+        # 保存解码后的重构图像
             torchvision.utils.save_image((x_recon + 1) / 2,
-                                         f'{args.project_save_path}/checkpoint/{dataset_name}/{args.name}/imgs/train/epoch{epoch}_recons.png')
+                                     f'{args.project_save_path}/checkpoint/{dataset_name}/{args.name}/imgs/train/epoch{epoch}_recons.png')
 
-            # 保存边缘提取图像
+        # 保存边缘提取图像
             torchvision.utils.save_image((edge_img + 1) / 2,
-                                         f'{args.project_save_path}/checkpoint/{dataset_name}/{args.name}/imgs/train/epoch{epoch}_edge.png')
+                                     f'{args.project_save_path}/checkpoint/{dataset_name}/{args.name}/imgs/train/epoch{epoch}_edge.png')
 
-            # 将这些图像记录到 TensorBoard
-            writer.add_images('Train/input_img', (real_img + 1) / 2, epoch)
-            writer.add_images('Train/recons_img', (x_recon + 1) / 2, epoch)
-            writer.add_images('Train/edge_img', (edge_img + 1) / 2, epoch)
+        # 将这些图像记录到 TensorBoard
+        writer.add_images('Train/input_img', (real_img + 1) / 2, epoch)
+        writer.add_images('Train/recons_img', (x_recon + 1) / 2, epoch)
+        writer.add_images('Train/edge_img', (edge_img + 1) / 2, epoch)
 
         # if batch_idx == len(trainloader) - 1:
         #     os.makedirs(f'{args.project_save_path}/checkpoint/{dataset_name}/{args.name}/imgs/train/', exist_ok=True)
@@ -179,18 +191,20 @@ def train(network, trainloader, opti, epoch):
 
         # break
 
-    logging.info(
-        f"Train [{epoch}] Loss: {loss_meter.avg} ReconsLoss: {recons_meter.avg} BOUNDARY: {boundary_meter.avg}")  # 删除DISTANCE: {dist_meter.avg}
-    writer.add_scalar('Train/loss', loss_meter.avg, epoch)
-    writer.add_scalar('Train/recons_loss', recons_meter.avg, epoch)
-    # writer.add_scalar('Train/distance', dist_meter.avg, epoch)
-    writer.add_scalar('Train/BOUNDARY', boundary_meter.avg, epoch)
-    # writer.add_scalar('Train/L2', l2_meter.avg, epoch)
-    # writer.add_scalar('Train/mean_r_q', mean_r_q.mean().item(), epoch)
-    # writer.add_scalar('Train/mean_r_p', mean_r_p.mean().item(), epoch)
-
-    # writer.add_image('Train/mean_sampled_z_q', mean_sampled_z_q.unsqueeze(0), epoch)
-    # writer.add_histogram(f'Train/mean_sampled_z_q_distribution', mean_sampled_z_q.sum(-1), epoch)
+        logging.info(
+            f"Train [{epoch}] Loss: {loss_meter.avg} ReconsLoss: {recons_meter.avg} BOUNDARY: {boundary_meter.avg}"
+            f"Classification_Loss: {classification_loss_meter.avg} ACC: {classification_meter.avg} ")
+        writer.add_scalar('Train/loss', loss_meter.avg, epoch)
+        writer.add_scalar('Train/recons_loss', recons_meter.avg, epoch)
+        # writer.add_scalar('Train/distance', dist_meter.avg, epoch)
+        writer.add_scalar('Train/BOUNDARY', boundary_meter.avg, epoch)
+        writer.add_scalar('Train/accuracy', classification_meter.avg, epoch)
+        writer.add_scalar('Train/Classification_Loss', classification_loss_meter.avg, epoch)
+        # writer.add_scalar('Train/L2', l2_meter.avg, epoch)
+        # writer.add_scalar('Train/mean_r_q', mean_r_q.mean().item(), epoch)
+        # writer.add_scalar('Train/mean_r_p', mean_r_p.mean().item(), epoch)
+        # writer.add_image('Train/mean_sampled_z_q', mean_sampled_z_q.unsqueeze(0), epoch)
+        # writer.add_histogram(f'Train/mean_sampled_z_q_distribution', mean_sampled_z_q.sum(-1), epoch)
 
     return loss_meter.avg
 
@@ -205,10 +219,12 @@ def test(network, testloader, epoch):
 
     boundary_meter = AverageMeter()  # 新增 Boundary Loss 记录器
     # l2_meter = AverageMeter()  # 新增L2 Loss 记录器
+    classification_meter = AverageMeter()  # 新增分类准确率记录器
+    classification_loss_meter = AverageMeter()  # 分类损失记录器
 
-    mean_r_q = 0
-    mean_r_p = 0
-    mean_sampled_z_q = 0
+    # mean_r_q = 0
+    # mean_r_p = 0
+    # mean_sampled_z_q = 0
 
     count_mul_add, hook_handles = add_hook(net)
 
@@ -217,8 +233,8 @@ def test(network, testloader, epoch):
 
         # 初始化边缘提取模块
         edge_extractor = CannyEdgeDetectionModule(device=network.module.device,
-                                                   in_channels=glv.network_config['in_channels'])
-        # edge_extractor = EdgeExtractionModule(device=network.device, in_channels=glv.network_config['in_channels'])
+                                                  in_channels=glv.network_config['in_channels'])
+        # edge_extractor = SobelEdgeExtractionModule(device=network.module.device, in_channels=glv.network_config['in_channels'])
         for batch_idx, (real_img, labels) in enumerate(testloader):
             real_img = real_img.to(init_device, non_blocking=True)
             labels = labels.to(init_device, non_blocking=True)
@@ -231,19 +247,20 @@ def test(network, testloader, epoch):
             spike_input = real_img.unsqueeze(-1).repeat(1, 1, 1, 1, n_steps).to(init_device)  # 确保输入张量在正确的设备上
             # spike_input = real_img.unsqueeze(-1).repeat(1, 1, 1, 1, n_steps)  # (N,C,H,W,T)
 
-            with torch.amp.autocast('cuda'):  # 使用混合精度
+            with torch.cuda.amp.autocast():  # 使用混合精度
                 # 只保留x_recon，去掉r_q, r_p的计算
                 # x_recon, _, _, sampled_z_q = network.module(spike_input, scheduled=glv.network_config['scheduled'])
                 # losses = network.module.loss_function_mmd(edge_img, x_recon)  # 不需要r_q和r_p了
                 # x_recon, _, _, _ = network.module(spike_input, scheduled=glv.network_config['scheduled'])
                 # losses = network.module.loss_function(edge_img, x_recon)
                 # 修改后
-                x_recon, latent = network.module(spike_input,
-                                                 scheduled=glv.network_config['scheduled'])
-                losses = network.module.loss_function(edge_img, x_recon)
+                # 前向传播，传递 labels
+                x_recon, logits = network.module(spike_input, labels, scheduled=glv.network_config['scheduled'])
+                losses = network.module.loss_function(edge_img, x_recon, logits, labels, epoch=epoch)
+                loss = losses['loss']
 
             # 检查 loss 是否包含 NaN
-            if torch.isnan(losses['loss']):
+            if torch.isnan(loss):
                 print(f"Batch {batch_idx}: Loss is NaN")
                 continue  # 跳过这个批次
 
@@ -252,17 +269,25 @@ def test(network, testloader, epoch):
             # mean_sampled_z_q = (sampled_z_q.mean(0).detach().cpu() + batch_idx * mean_sampled_z_q) / (
             #         batch_idx + 1)  # (C,T)
 
-            loss_meter.update(losses['loss'].detach().cpu().item())
+            loss_meter.update(loss.detach().cpu().item())
             recons_meter.update(losses['EdgeReconstruction_Loss'].detach().cpu().item())  # Edge reconstruction loss
             # dist_meter.update(losses['Distance_Loss'].detach().cpu().item())
             boundary_meter.update(losses['Boundary_Loss'].detach().cpu().item())  # 更新 Boundary Loss
+            classification_loss_meter.update(losses['Classification_Loss'].detach().cpu().item())
             # l2_meter.update(losses['L2_Loss'].detach().cpu().item())  # 更新 L2 Loss
 
+            # 计算分类准确率
+            _, predicted = torch.max(logits, 1)
+            correct = (predicted == labels).sum().item()
+            accuracy = correct / labels.size(0)
+            classification_meter.update(accuracy)
+
             print(
-                f'Test[{epoch}/{max_epoch}] [{batch_idx}/{len(testloader)}] Loss: {loss_meter.avg}, RECONS: {recons_meter.avg}, BOUNDARY: {boundary_meter.avg}')  # 删除, DISTANCE: {dist_meter.avg}
+                f'Test[{epoch}/{max_epoch}] [{batch_idx}/{len(testloader)}] Loss: {loss_meter.avg:},'
+                f' RECONS: {recons_meter.avg}\n BOUNDARY: {boundary_meter.avg:}, Classification_Loss: {classification_loss_meter.avg:} ACC: {classification_meter.avg:} ')
 
             # 在第一轮和最后一轮，且是第一个批次时保存图像
-            if (epoch == 0 or epoch == max_epoch - 1 or epoch == 20) and batch_idx == 0:  # max_epoch - 1
+            if (epoch % 10 == 0) and batch_idx == 0:  # max_epoch - 1
                 os.makedirs(f'{args.project_save_path}/checkpoint/{dataset_name}/{args.name}/imgs/test/', exist_ok=True)
 
                 # 保存原始输入图像
@@ -288,14 +313,12 @@ def test(network, testloader, epoch):
             # break
 
     logging.info(
-        f"Test [{epoch}] Loss: {loss_meter.avg} ReconsLoss: {recons_meter.avg} BOUNDARY: {boundary_meter.avg}")  # 删除 DISTANCE: {dist_meter.avg}
+        f"Test [{epoch}] Loss: {loss_meter.avg} ReconsLoss: {recons_meter.avg} BOUNDARY: {boundary_meter.avg} Classification_Loss: {classification_loss_meter.avg} ACC: {classification_meter.avg} ")
     writer.add_scalar('Test/loss', loss_meter.avg, epoch)
     writer.add_scalar('Test/recons_loss', recons_meter.avg, epoch)
-    # writer.add_scalar('Test/distance', dist_meter.avg, epoch)
     writer.add_scalar('Test/BOUNDARY', boundary_meter.avg, epoch)
-    # writer.add_scalar('Train/L2', l2_meter.avg, epoch)
-    # writer.add_scalar('Test/mean_r_q', mean_r_q.mean().item(), epoch)
-    # writer.add_scalar('Test/mean_r_p', mean_r_p.mean().item(), epoch)
+    writer.add_scalar('Test/accuracy', classification_meter.avg, epoch)
+    writer.add_scalar('Test/Classification_Loss', classification_loss_meter.avg, epoch)
     writer.add_scalar('Test/mul', count_mul_add.mul_sum.item() / len(testloader), epoch)
     writer.add_scalar('Test/add', count_mul_add.add_sum.item() / len(testloader), epoch)
 
@@ -326,8 +349,8 @@ if __name__ == '__main__':
     seed_all()
 
     # 初始化设备并选择多卡
-    init_device = torch.device("cuda:2")  # 默认使用 cuda:0
-    device_ids = [2, 3]  # 使用 GPU 2 和 GPU 3
+    init_device = torch.device("cuda:0")  # 默认使用 cuda:0
+    device_ids = [0]  # 使用 GPU 2 和 GPU 3
 
     parser = argparse.ArgumentParser()  # 解析命令行参数
     parser.add_argument('-name', default='tmp', type=str)
@@ -347,7 +370,7 @@ if __name__ == '__main__':
         raise Exception('Unrecognized config file.')
 
     if args.device is None:
-        init_device = torch.device("cuda:2")
+        init_device = torch.device("cuda:0")
     else:
         init_device = torch.device(f"cuda:{args.device}")
 
@@ -360,7 +383,7 @@ if __name__ == '__main__':
     logging.info(network_config)
     print(network_config)
 
-    glv.init(network_config, devs=[2, 3])  # glv.init(network_config, [args.device])
+    glv.init(network_config, devs=[0])  # glv.init(network_config, [args.device])
 
     # distance_lambda = glv.network_config['distance_lambda']  # 已经在配置文件中定义了这个值
     # mmd_type = glv.network_config['mmd_type']  # 已经在配置文件中定义了这个值
@@ -383,13 +406,14 @@ if __name__ == '__main__':
     # distance_lambda = glv.network_config['distance_lambda']
     loss_func = glv.network_config['loss_func']
     # mmd_type = glv.network_config['mmd_type']
-    latent_dim = glv.network_config['latent_dim']
+    latent_dim_recon = glv.network_config['latent_dim_recon']
+    latent_dim_class = glv.network_config['latent_dim_class']
     try:
         add_name = glv.network_config['add_name']
     except:
         add_name = None
 
-    args.name = f'edge_sae_loss_func-{loss_func}-latent_dim-{latent_dim}'
+    args.name = f'edge_sae_loss_func-{loss_func}-latent_dim_recon-{latent_dim_recon}-latent_dim_class-{latent_dim_class}'
 
     if add_name is not None:
         args.name = add_name + '-' + args.name
@@ -426,15 +450,20 @@ if __name__ == '__main__':
     logging.info("dataset loaded")
 
     if network_config['model'] == 'SAE':
-        net = edge_sae.SAE(device=init_device,
-                           boundary_weight=boundary_weight)  # 设置 Boundary 权重
+        net = edge_sae.SAE(
+            device=init_device,
+            boundary_weight=boundary_weight,
+            latent_dim_recon=latent_dim_recon,
+            latent_dim_class=latent_dim_class,
+            num_classes=10  # 添加 num_classes 参数
+        )
     elif network_config['model'] == 'ESVAE_large':
         net = esvae.ESVAELarge(device=init_device, distance_lambda=distance_lambda, mmd_type=mmd_type)
     else:
         raise Exception('not defined model')
 
     # 使用 DataParallel 来支持多卡训练
-    net = torch.nn.DataParallel(net, device_ids=[2, 3])  # 使用 GPU 2 和 GPU 3   新增的一行
+    net = torch.nn.DataParallel(net, device_ids=[0])  # 使用 GPU 2 和 GPU 3   新增的一行
     net = net.to(init_device)  # 将模型移动到默认设备（cuda:0）
 
     if args.checkpoint is not None:

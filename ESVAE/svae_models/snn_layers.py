@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -132,7 +133,7 @@ class tdLinear(nn.Linear):
         x = x.transpose(1, 2) # (N, T, C)
         y = F.linear(x, self.weight, self.bias)
         y = y.transpose(1, 2)# (N, C, T)
-        
+
         if self.bn is not None:
             y = y[:,:,None,None,:]
             y = self.bn(y)

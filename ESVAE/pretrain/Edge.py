@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
-from .snn_layers import *
-from .fsvae_prior import *
-from .fsvae_posterior import *
+from svae_models.snn_layers import *
+from svae_models.fsvae_prior import *
+from svae_models.fsvae_posterior import *
 import torch.nn.functional as F
 
 import global_v as glv
@@ -10,288 +10,13 @@ import global_v as glv
 import math
 
 # 12.13
-from .snn_layers import MembraneOutputLayer
+from svae_models.snn_layers import MembraneOutputLayer
 
 # 12.12
 # 新增损失函数
 from boundary_loss import boundary_loss
 import math
 import numpy as np
-
-# 分类器1
-# class Classifier(nn.Module):
-#     def __init__(self, latent_dim_class, num_classes=10):
-#         super(Classifier, self).__init__()
-#         self.fc1 = nn.Linear(latent_dim_class, 256)
-#         self.relu = nn.ReLU()
-#         self.dropout = nn.Dropout(0.5)
-#         self.fc2 = nn.Linear(256, num_classes)
-#
-#     def forward(self, latent):
-#         x = self.fc1(latent)
-#         x = self.relu(x)
-#         x = self.dropout(x)
-#         logits = self.fc2(x)
-#         return logits
-
-# # 定义分类器(基于脉冲频率)  FASHION-MNIST
-class Classifier(nn.Module):
-    def __init__(self, latent_dim_class, num_classes=10):
-        super(Classifier, self).__init__()
-        # 第一层：线性变换 -> 批归一化 -> 激活函数 -> 丢弃法
-        self.fc1 = nn.Linear(latent_dim_class, 256)
-        self.bn1 = nn.BatchNorm1d(256)
-        self.relu1 = nn.LeakyReLU(0.1)
-        self.dropout1 = nn.Dropout(0.9)  # 0.5
-
-        # 输出层：线性变换
-        self.fc2 = nn.Linear(256, num_classes)
-
-    def forward(self, latent):
-        x = self.fc1(latent)
-        x = self.bn1(x)
-        x = self.relu1(x)
-        x = self.dropout1(x)
-
-        logits = self.fc2(x)
-        return logits
-import torch.nn as nn
-
-# class Classifier(nn.Module):
-#     def __init__(self, latent_dim_class=256, num_classes=10):
-#         super(Classifier, self).__init__()
-#
-#         # 第一层：线性变换 -> 批归一化 -> 激活函数 -> 丢弃法
-#         self.fc1 = nn.Linear(latent_dim_class, 256)
-#         self.bn1 = nn.BatchNorm1d(256)
-#         self.relu1 = nn.LeakyReLU(0.01)
-#         self.dropout1 = nn.Dropout(0.5)
-#
-#         # 第二层：线性变换 -> 批归一化 -> 激活函数 -> 丢弃法
-#         self.fc2 = nn.Linear(256, 128)
-#         self.bn2 = nn.BatchNorm1d(128)
-#         self.relu2 = nn.LeakyReLU(0.01)
-#         self.dropout2 = nn.Dropout(0.5)
-#
-#         # 输出层：线性变换
-#         self.fc3 = nn.Linear(128, num_classes)
-#
-#         # 可选：添加一个残差连接
-#         # self.residual = nn.Linear(latent_dim_class, num_classes)
-#
-#     def forward(self, latent):
-#         x = self.fc1(latent)
-#         x = self.bn1(x)
-#         x = self.relu1(x)
-#         x = self.dropout1(x)
-#
-#         x = self.fc2(x)
-#         x = self.bn2(x)
-#         x = self.relu2(x)
-#         x = self.dropout2(x)
-#
-#         logits = self.fc3(x)
-#
-#         # 可选：添加残差连接
-#         # residual = self.residual(latent)
-#         # logits += residual
-#
-#         return logits
-# class Classifier(nn.Module):
-#     def __init__(self, latent_dim_class=256, num_classes=10):
-#         super(Classifier, self).__init__()
-#
-#         # 第一层：线性变换 -> 批归一化 -> 激活函数 -> 丢弃法
-#         self.fc1 = nn.Linear(latent_dim_class, 256)
-#         self.bn1 = nn.BatchNorm1d(256)
-#         self.relu1 = nn.LeakyReLU(0.01)
-#         self.dropout1 = nn.Dropout(0.5)
-#
-#         # 输出层：线性变换
-#         self.fc2 = nn.Linear(256, num_classes)
-#
-#         # 可选：添加一个残差连接
-#         self.residual = nn.Linear(latent_dim_class, num_classes)
-#
-#     def forward(self, latent):
-#         x = self.fc1(latent)
-#         x = self.bn1(x)
-#         x = self.relu1(x)
-#         x = self.dropout1(x)
-#
-#         logits = self.fc2(x)
-#
-#         # 可选：添加残差连接
-#         residual = self.residual(latent)
-#         logits += residual
-#
-#         return logits
-
-
-class SAE(nn.Module):
-    def __init__(self, device, boundary_weight, latent_dim_recon, latent_dim_class, num_classes=10):
-        super().__init__()
-
-        in_channels = glv.network_config['in_channels']
-        latent_dim_recon = latent_dim_recon
-        latent_dim_class = latent_dim_class
-
-        # 初始化分类器
-        self.classifier = Classifier(latent_dim_class, num_classes)
-
-        self.n_steps = glv.network_config['n_steps']
-        self.device = device
-        self.boundary_weight = boundary_weight
-
-        hidden_dims = [32, 64, 128, 256]
-        self.hidden_dims = hidden_dims.copy()
-
-        # 添加边缘提取模块
-        self.edge_extractor = SobelEdgeExtractionModule(device=device, in_channels=in_channels)
-
-        # Build Encoder
-        modules = []
-        is_first_conv = True
-        for h_dim in hidden_dims:
-            modules.append(
-                tdConv(in_channels,
-                       out_channels=h_dim,
-                       kernel_size=3,
-                       stride=2,
-                       padding=1,
-                       bias=True,
-                       bn=tdBatchNorm(h_dim),
-                       spike=LIFSpike(),
-                       is_first_conv=is_first_conv)
-            )
-            in_channels = h_dim
-            is_first_conv = False
-
-        self.encoder = nn.Sequential(*modules)
-
-        # 将潜在维度分为两个部分
-        self.before_latent_recon = tdLinear(hidden_dims[-1] * 4,
-                                            latent_dim_recon,
-                                            bias=True,
-                                            bn=tdBatchNorm(latent_dim_recon),
-                                            spike=LIFSpike())
-
-        self.before_latent_class = tdLinear(hidden_dims[-1] * 4,
-                                            latent_dim_class,
-                                            bias=True,
-                                            bn=tdBatchNorm(latent_dim_class),
-                                            spike=LIFSpike())
-
-        # Build Decoder
-        modules = []
-
-        self.decoder_input = tdLinear(latent_dim_recon,
-                                      hidden_dims[-1] * 4,
-                                      bias=True,
-                                      bn=tdBatchNorm(hidden_dims[-1] * 4),
-                                      spike=LIFSpike())
-
-        hidden_dims.reverse()
-
-        for i in range(len(hidden_dims) - 1):
-            modules.append(
-                tdConvTranspose(hidden_dims[i],
-                                hidden_dims[i + 1],
-                                kernel_size=3,
-                                stride=2,
-                                padding=1,
-                                output_padding=1,
-                                bias=True,
-                                bn=tdBatchNorm(hidden_dims[i + 1]),
-                                spike=LIFSpike())
-            )
-        self.decoder = nn.Sequential(*modules)
-
-        self.final_layer = nn.Sequential(
-            tdConvTranspose(hidden_dims[-1],
-                            hidden_dims[-1],
-                            kernel_size=3,
-                            stride=2,
-                            padding=1,
-                            output_padding=1,
-                            bias=True,
-                            bn=tdBatchNorm(hidden_dims[-1]),
-                            spike=LIFSpike()),
-            tdConvTranspose(hidden_dims[-1],
-                            out_channels=1,
-                            kernel_size=3,
-                            padding=1,
-                            bias=True,
-                            bn=None,
-                            spike=None)
-        )
-
-        self.p = 0
-
-        self.membrane_output_layer = MembraneOutputLayer(self.n_steps)
-
-        self.psp = PSP()
-
-    def forward(self, x, labels, scheduled=False):
-        latent_recon, latent_class = self.encode(x)  # [N, latent_dim_recon, T]
-
-        # latent_class = self.before_latent_class(latent_class)  # [N, latent_dim_class, T]
-        latent_freq_class = torch.sum(latent_class, dim=2) / latent_class.shape[2]  # [N, latent_dim_class]
-        logits = self.classifier(latent_freq_class)  # [N, num_classes]
-        x_recon = self.decode(latent_recon)
-        return x_recon, logits
-
-    def encode(self, x):
-        x = self.encoder(x)  # (N,C,H,W,T)
-        x = torch.flatten(x, start_dim=1, end_dim=3)  # (N,C*H*W,T)
-        latent_recon = self.before_latent_recon(x)  # (N, latent_dim_recon, T)
-        latent_class = self.before_latent_class(x)
-        return latent_recon, latent_class
-
-    def decode(self, z_recon):
-        result = self.decoder_input(z_recon)  # (N, C*H*W, T)
-        result = result.view(result.shape[0], self.hidden_dims[-1], 2, 2, self.n_steps)  # (N,C,H,W,T)
-        result = self.decoder(result)  # (N,C,H,W,T)
-        result = self.final_layer(result)  # (N,C,H,W,T)
-        out = torch.tanh(self.membrane_output_layer(result))
-        return out
-
-    def loss_function(self, edge_img, recons_img, logits, labels, epoch):
-        # 计算边缘重建损失（均方误差）
-        edge_loss = F.mse_loss(recons_img, edge_img)
-
-        # 计算 Boundary Loss
-        b_loss = boundary_loss(recons_img, edge_img)
-
-        # 计算分类损失
-        classification_loss = F.cross_entropy(logits, labels)
-        # 动态调整分类权重，使用指数衰减
-        classification_loss_weight = max(0.1, math.exp(-0.05 * epoch))
-
-        # 组合新总损失
-        loss = edge_loss + self.boundary_weight * b_loss + classification_loss_weight * classification_loss
-
-        # 检查总损失是否包含 NaN
-        if torch.isnan(loss):
-            print("Total loss contains NaN")
-
-        # 返回多个损失项以供记录
-        return {
-            'loss': loss,
-            'EdgeReconstruction_Loss': edge_loss,
-            'Boundary_Loss': b_loss,
-            'Classification_Loss': classification_loss,
-        }
-
-    def weight_clipper(self):
-        with torch.no_grad():
-            for p in self.parameters():
-                p.data.clamp_(-4, 4)
-
-    def update_p(self, epoch, max_epoch):
-        init_p = 0.1
-        last_p = 0.3
-        self.p = (last_p - init_p) * epoch / max_epoch + init_p
 
 
 class SobelEdgeExtractionModule(nn.Module):
@@ -484,7 +209,7 @@ class EnhancedCannyEdgeDetectionModule(nn.Module):
         """Generate a Gaussian kernel using vectorized operations."""
         ax = torch.arange(-size // 2 + 1., size // 2 + 1., device=self.device)
         xx, yy = torch.meshgrid(ax, ax, indexing='ij')  # 使用 'ij' 索引以匹配二维坐标
-        kernel = torch.exp(-(xx**2 + yy**2) / (2. * sigma**2))
+        kernel = torch.exp(-(xx ** 2 + yy ** 2) / (2. * sigma ** 2))
         kernel = kernel / torch.sum(kernel)  # 归一化核
         return kernel
 
@@ -562,4 +287,3 @@ class EnhancedCannyEdgeDetectionModule(nn.Module):
         output = strong_edges | connected_weak
 
         return output.float()
-

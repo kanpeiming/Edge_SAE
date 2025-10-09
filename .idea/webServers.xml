@@ -9,6 +9,27 @@
           </advancedOptions>
         </fileTransfer>
       </webServer>
+      <webServer id="dd124832-35f5-4079-a59a-b2a900f7685d" name="7号机">
+        <fileTransfer accessType="SFTP" host="127.0.0.1" port="257" sshConfigId="528f42c8-7703-4d61-b25b-34a987f8b8a6" sshConfig="7号机" keyPair="true">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="0" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+      <webServer id="ee4c4d06-29e1-47f8-9b39-308e4f691e47" name="3090(项目级别)">
+        <fileTransfer accessType="SFTP" host="10.8.135.1" port="57827" sshConfigId="f5705cc2-ff39-4d92-8140-2cb79263101f" sshConfig="root@10.8.135.1:57827(3090)">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+      <webServer id="aab38ae4-3c13-4b0a-a97e-7be4dcd915da" name="3090-55885">
+        <fileTransfer accessType="SFTP" host="10.8.135.1" port="55885" sshConfigId="45112eb3-d697-489f-9ccf-96d49b5ef3e2" sshConfig="3090-55885">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
     </option>
   </component>
 </project>

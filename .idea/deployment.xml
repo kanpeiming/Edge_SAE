@@ -3,6 +3,27 @@
   <component name="PublishConfigData" autoUpload="Always" serverName="3号机" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
     <option name="confirmBeforeUploading" value="false" />
     <serverData>
+      <paths name="3090">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/user/kpm/RGB_to_DVS_TL" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="3090(项目级别)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/user/kpm/RGB_to_DVS_TL" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="3090-55885">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/user/kpm/RGB_to_DVS_TL" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
       <paths name="3号机">
         <serverdata>
           <mappings>
@@ -10,17 +31,38 @@
           </mappings>
         </serverdata>
       </paths>
+      <paths name="4号机 (2)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/dwj/kpm/ESVAE" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="4号机 (3)">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="4号机 (4)">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="7号机">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/dwj/kpm/ESVAE" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
       <paths name="kpm(ESVAE)">
         <serverdata>
           <mappings>
             <mapping deploy="/home/yb/kpm/ESVAE" local="$PROJECT_DIR$" web="/" />
-          </mappings>
-        </serverdata>
-      </paths>
-      <paths name="root@10.8.135.1:51824 password">
-        <serverdata>
-          <mappings>
-            <mapping deploy="/home/user/kpm/ESVAE" local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>
@@ -42,6 +84,27 @@
         <serverdata>
           <mappings>
             <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="root@10.8.135.1:55885 password">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/user/kpm/RGB_to_DVS_TL" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="root@10.8.135.1:55885 password (2)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/tmp/pycharm_project_338" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="root@10.8.135.1:55885 password (3)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/user/kpm/ESVAE" local="$PROJECT_DIR$" />
           </mappings>
         </serverdata>
       </paths>
