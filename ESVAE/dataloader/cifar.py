@@ -21,10 +21,10 @@ from torch.utils.data import Dataset, random_split
 from torch.utils.data.sampler import SubsetRandomSampler
 
 # your own data dir
-USER_NAME = 'zhan'
-DIR = {'CIFAR10': f'/data/{USER_NAME}/Event_Camera_Datasets/CIFAR10/cifar10',
-       'CIFAR10DVS': f'/data/{USER_NAME}/Event_Camera_Datasets/CIFAR10/CIFAR10DVS/temporal_effecient_training_0.9_mat',
-       'CIFAR10DVS_CATCH': f'/data/{USER_NAME}/Event_Camera_Datasets/CIFAR10/CIFAR10DVS_dst_cache',
+USER_NAME = 'kpm'
+DIR = {'CIFAR10': f'/home/user/{USER_NAME}/kpm/Dataset/CIFAR10/cifar10',
+       'CIFAR10DVS': f'/home/user/Datasets/CIFAR10/CIFAR10DVS/temporal_effecient_training_0.9_mat',
+       'CIFAR10DVS_CATCH': f'/home/user/{USER_NAME}/kpm/Dataset/CIFAR10/CIFAR10DVS_dst_cache',
        }
 
 
@@ -166,13 +166,13 @@ def get_cifar10_DVS(batch_size, T, split_ratio=0.9, train_set_ratio=1, size=32, 
             torch.save(train_set, train_set_pth)
             torch.save(test_set, test_set_pth)
     elif encode_type == "TET":
-        path = '/data/zhan/Event_Camera_Datasets/CIFAR10/CIFAR10DVS/temporal_effecient_training_0.9_mat'
+        path = '/home/user/Datasets/CIFAR10/CIFAR10DVS/temporal_effecient_training_0.9_mat'
         train_path = path + '/train'
         test_path = path + '/test'
         train_set = DVSCifar10v1(root=train_path)
         test_set = DVSCifar10v1(root=test_path)
     elif encode_type == "3_channel":
-        path = '/data/zhan/Event_Camera_Datasets/CIFAR10/CIFAR10DVS/temporal_effecient_training_0.9_mat'
+        path = '/home/user/Datasets/CIFAR10/CIFAR10DVS/temporal_effecient_training_0.9_mat'
         train_path = path + '/train'
         test_path = path + '/test'
         train_set = Channel_3_DVSCifar10(root=train_path)

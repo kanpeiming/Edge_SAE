@@ -36,8 +36,8 @@ parser.add_argument('--dvs_encoding_type', type=str, default='TET', choices=['TE
 parser.add_argument('--model', type=str, default='vgg16')
 parser.add_argument('--lamb', default=1e-3, type=float, metavar='N',
                     help='adjust the norm factor to avoid outlier (default: 0.0)')
-parser.add_argument('--log_dir', type=str, default='/data/kpm/EI/log_dir/baseline', help='the path of tensorboard dir.')
-parser.add_argument('--checkpoint', type=str, default='/data/kpm/EI/checkpoints/baseline',
+parser.add_argument('--log_dir', type=str, default='/home/user/kpm/kpm/results/SDSTL/baseline/log_dir', help='the path of tensorboard dir.')
+parser.add_argument('--checkpoint', type=str, default='/home/user/kpm/kpm/results/SDSTL/baseline/checkpoints',
                     help='the path of checkpoint dir.')
 parser.add_argument('--pretrained_path', type=str,
                     default=None,
@@ -48,7 +48,7 @@ args = parser.parse_args()
 
 # 参数预设值
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-device = torch.device("cuda:1")
+device = torch.device("cuda:0")
 
 # log_name = f"Temporal_Efficient_Training_with_{args.dvs_sample_ratio}_dvs_data"
 log_name = f"addBN_CIFAR10_TET_{args.data_set}-data_set_{args.seed}-seed_{args.dvs_sample_ratio}-dvs_data_{args.dvs_encoding_type}-dvs_encoder_{args.lr}-lr_VGGSNN"

@@ -50,9 +50,9 @@ parser.add_argument('--encoder_tl_lamb', default=0.1, type=float, metavar='N',
                     help='encoder transfer learning loss ratio')
 parser.add_argument('--feature_tl_lamb', default=0.1, type=float, metavar='N',
                     help='feature transfer learning loss ratio')
-parser.add_argument('--log_dir', type=str, default='/data/kpm/pretrain/log_dir',
+parser.add_argument('--log_dir', type=str, default='/home/user/kpm/kpm/results/SDSTL/pretrain/log_dir',
                     help='the path of tensorboard dir.')
-parser.add_argument('--checkpoint', type=str, default='/data/kpm/pretrain/checkpoints',
+parser.add_argument('--checkpoint', type=str, default='/home/user/kpm/kpm/results/SDSTL/pretrain/checkpoints',
                     help='the path of checkpoint dir.')
 parser.add_argument('--GPU_id', type=int, default=0, help='the id of used GPU.')
 parser.add_argument('--num_classes', type=int, default=10, help='the number of data classes.')

@@ -1,22 +1,6 @@
 import torch
 import torch.nn as nn
-from svae_models.snn_layers import *
-from svae_models.fsvae_prior import *
-from svae_models.fsvae_posterior import *
 import torch.nn.functional as F
-
-import global_v as glv
-
-import math
-
-# 12.13
-from svae_models.snn_layers import MembraneOutputLayer
-
-# 12.12
-# 新增损失函数
-from boundary_loss import boundary_loss
-import math
-import numpy as np
 
 
 class SobelEdgeExtractionModule(nn.Module):
@@ -287,3 +271,75 @@ class EnhancedCannyEdgeDetectionModule(nn.Module):
         output = strong_edges | connected_weak
 
         return output.float()
+
+
+class MultiThresholdCannyEdgeModule(nn.Module):
+    """
+    多阈值Canny边缘检测模块 - 输出3通道
+    
+    通道设计：
+    - Channel 0: 弱边缘 (低阈值) - 捕获更多细节
+    - Channel 1: 中等边缘 (中阈值) - 平衡
+    - Channel 2: 强边缘 (高阈值) - 主要结构
+    
+    优势：
+    1. 多尺度边缘信息
+    2. 与RGB 3通道结构对应
+    3. 预训练时更自然
+    """
+    
+    def __init__(self, device, in_channels=3):
+        super(MultiThresholdCannyEdgeModule, self).__init__()
+        self.device = device
+        self.in_channels = in_channels
+        
+        # 三个不同阈值的Canny检测器
+        # 弱边缘：捕获更多细节
+        self.canny_weak = EnhancedCannyEdgeDetectionModule(
+            device=device,
+            in_channels=in_channels,
+            low_threshold=0.05,   # 低阈值：更敏感
+            high_threshold=0.15
+        )
+        
+        # 中等边缘：平衡
+        self.canny_medium = EnhancedCannyEdgeDetectionModule(
+            device=device,
+            in_channels=in_channels,
+            low_threshold=0.15,   # 中等阈值
+            high_threshold=0.30
+        )
+        
+        # 强边缘：主要结构
+        self.canny_strong = EnhancedCannyEdgeDetectionModule(
+            device=device,
+            in_channels=in_channels,
+            low_threshold=0.25,   # 高阈值：只保留显著边缘
+            high_threshold=0.50
+        )
+    
+    def forward(self, x):
+        """
+        前向传播
+        
+        Args:
+            x: (B, 3, H, W) - RGB图像
+        
+        Returns:
+            edges: (B, 3, H, W) - 3通道边缘图
+                - Channel 0: 弱边缘
+                - Channel 1: 中等边缘
+                - Channel 2: 强边缘
+        """
+        if x.dim() != 4:
+            raise ValueError(f"Expected 4D input, got {x.dim()}D")
+        
+        # 提取三个不同强度的边缘
+        edges_weak = self.canny_weak(x)      # (B, 1, H, W)
+        edges_medium = self.canny_medium(x)  # (B, 1, H, W)
+        edges_strong = self.canny_strong(x)  # (B, 1, H, W)
+        
+        # 拼接为3通道
+        edges = torch.cat([edges_weak, edges_medium, edges_strong], dim=1)  # (B, 3, H, W)
+        
+        return edges
