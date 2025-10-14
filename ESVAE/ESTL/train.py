@@ -95,6 +95,10 @@ def parse_args():
                         help='Path to pretrained edge branch weights')
     parser.add_argument('--freeze_edge', action='store_true',
                         help='Freeze edge branch parameters')
+    
+    # Experiment naming
+    parser.add_argument('--exp_name', type=str, default=None,
+                        help='Custom experiment name prefix (default: auto-generate)')
 
     args = parser.parse_args()
     return args
@@ -111,8 +115,15 @@ def main():
     seed_all(args.seed)
     
     # Experiment name
+    if args.exp_name is not None:
+        # 使用自定义实验名前缀
+        exp_prefix = args.exp_name
+    else:
+        # 默认前缀
+        exp_prefix = "EdgeGuided"
+    
     exp_name = (
-        f"EdgeGuided_{args.data_set}_"
+        f"{exp_prefix}_{args.data_set}_"
         f"fusion{''.join(map(str, args.fusion_stages))}_{args.fusion_type}_"
         f"freeze{args.freeze_edge}_"
         f"T{args.T}_lr{args.lr}_wd{args.weight_decay}_"

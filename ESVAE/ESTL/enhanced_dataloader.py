@@ -145,6 +145,11 @@ class EnhancedDVSCifar10(Dataset):
     Enhanced DVS CIFAR10 dataset with comprehensive augmentation
     Now supports returning both RGB and DVS data for edge-guided training
     Handles mismatch between RGB and DVS data sizes using modulo indexing per class
+    
+    改进策略：
+    1. 训练集始终以RGB为准(use_rgb_size=True) - 充分利用RGB数据
+    2. DVS通过类内循环匹配 - 避免单个DVS样本过度重复
+    3. 验证集以DVS为准 - 真实反映DVS泛化能力
     """
     
     def __init__(self, root, train=True, augmentation=True, target_transform=None, rgb_root=None, dvs_train_set_ratio=1.0, split='train', val_split=0.1, use_rgb_size=False):
@@ -156,7 +161,8 @@ class EnhancedDVSCifar10(Dataset):
         self.dvs_train_set_ratio = dvs_train_set_ratio
         self.split = split  # 'train', 'val', or 'test'
         self.val_split = val_split  # 验证集比例
-        self.use_rgb_size = use_rgb_size  # 是否以RGB数据量为准
+        # 改进：训练集强制以RGB为准，充分利用RGB数据
+        self.use_rgb_size = use_rgb_size if split != 'train' else True  # 训练集强制True
         
         # 基础变换
         self.resize = transforms.Resize(size=(32, 32))
@@ -260,22 +266,23 @@ class EnhancedDVSCifar10(Dataset):
         return cumulative
     
     def __len__(self):
-        if self.train and self.rgb_data is not None and self.split == 'train' and self.use_rgb_size:
-            # 训练集且use_rgb_size=True：以RGB数据量为准，充分利用RGB数据
-            # DVS数据会通过模运算在__getitem__中循环使用
+        # 改进策略：
+        # 训练集：以RGB为准（充分利用50k RGB数据，DVS通过类内循环匹配）
+        # 验证集/测试集：以DVS为准（真实评估DVS泛化能力）
+        if self.train and self.rgb_data is not None and self.split == 'train':
+            # 训练集：始终以RGB数据量为准（充分利用RGB数据）
             return len(self.rgb_data)
         else:
-            # 默认：以DVS数据量为准（避免DVS过度重复）
-            # 验证集、测试集、或use_rgb_size=False时
+            # 验证集、测试集：以DVS数据量为准（避免虚高精度）
             return len(self.dvs_samples)
     
     def __getitem__(self, index):
         import bisect
         from PIL import Image
         
-        if self.train and self.rgb_data is not None and self.split == 'train' and self.use_rgb_size:
-            # 训练集模式（use_rgb_size=True）：以RGB为准，返回(RGB, DVS)对
-            # index是基于RGB的，需要找到对应类别的DVS样本（循环使用）
+        if self.train and self.rgb_data is not None and self.split == 'train':
+            # 训练集模式：以RGB为准（充分利用RGB数据），DVS通过类内循环匹配
+            # 改进：添加随机性，避免固定的DVS样本匹配
             
             # 1. 获取RGB图像和类别
             rgb_img = self.rgb_data[index]
@@ -286,7 +293,7 @@ class EnhancedDVSCifar10(Dataset):
             rgb_img = self.tensorx(rgb_img)
             rgb_img = self.rgb_normalize(rgb_img)  # (3, H, W)
             
-            # 2. 根据RGB的类别，从DVS数据中获取同类别的样本（使用模运算循环）
+            # 2. 根据RGB的类别，从DVS数据中获取同类别的样本
             # 找到RGB图像对应的类别
             dataset_idx = bisect.bisect_right(self.rgb_cumulative_sizes, index)
             
@@ -299,8 +306,17 @@ class EnhancedDVSCifar10(Dataset):
             dvs_index_end = self.dvs_cumulative_sizes[dataset_idx]
             dvs_class_size = dvs_index_end - dvs_index_start
             
-            # 使用模运算在DVS的该类别内循环
-            dvs_index = dvs_index_start + (rgb_offset_in_class % dvs_class_size)
+            # 改进：使用模运算+随机扰动，增加DVS样本多样性
+            # 基础索引：模运算循环
+            base_dvs_offset = rgb_offset_in_class % dvs_class_size
+            # 随机扰动：±1范围内随机选择（如果类别有足够样本）
+            if dvs_class_size > 3 and self.augmentation:
+                random_offset = random.randint(-1, 1)
+                final_dvs_offset = (base_dvs_offset + random_offset) % dvs_class_size
+            else:
+                final_dvs_offset = base_dvs_offset
+            
+            dvs_index = dvs_index_start + final_dvs_offset
             
             # 3. 加载DVS数据
             dvs_filepath = self.dvs_samples[dvs_index]
@@ -483,15 +499,17 @@ def get_enhanced_cifar10_DVS(batch_size, T=10, split_ratio=0.9, train_set_ratio=
     val_has_rgb = val_dataset.rgb_data is not None
     
     if train_has_rgb:
-        print(f"✓ Train: {len(train_dataset)} DVS samples paired with {len(train_dataset.rgb_data)} RGB samples (with augmentation)")
+        print(f"✓ Train: {len(train_dataset.rgb_data)} RGB samples paired with {len(train_dataset.dvs_samples)} DVS samples (RGB-based, DVS循环)")
+        print(f"   策略: 以RGB为准充分利用数据 - 每个epoch遍历全部{len(train_dataset.rgb_data)}个RGB样本")
     else:
         print(f"✓ Train: {len(train_dataset)} samples (DVS-only, with augmentation)")
     
     if val_has_rgb:
-        print(f"✓ Val: {len(val_dataset)} DVS samples paired with {len(val_dataset.rgb_data)} RGB samples (no augmentation)")
+        print(f"✓ Val: {len(val_dataset)} DVS samples paired with {len(val_dataset.rgb_data)} RGB samples (DVS-based)")
+        print(f"   策略: 以DVS为准真实评估泛化能力")
     else:
-        print(f"✓ Val: {len(val_dataset)} samples (DVS-only, no augmentation)")
-    
+          print(f"✓ Val: {len(val_dataset)} samples (DVS-only, no augmentation)")
+
     print(f"✓ Test: {len(test_dataset)} samples (DVS-only, independent)")
     
     # 训练集加载器

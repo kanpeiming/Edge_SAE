@@ -174,20 +174,26 @@ class SNND2CAFFusion(nn.Module):
 
 class CrossModalAttentionFusion(nn.Module):
     """
-    跨模态注意力融合模块
+    跨模态注意力融合模块 - 改进版（参考ESEG D2CAF）
     DVS特征作为Query，动态查询RGB结构特征(Key/Value)
     
-    核心思想：
-    - DVS主动学习：Query = DVS ("我需要什么结构信息？")
-    - RGB知识库：Key/Value = RGB ("我有什么结构知识")
-    - 动态选择：Attention自动学习哪些RGB特征对DVS有用
+    核心改进（参考ESEG论文§D2CAF）：
+    1. DIM (Density-aware Importance Modulation) - 密度感知重要性调制
+       - Similarity weighting: 相似度加权（RGB与DVS特征对齐程度）
+       - Density weighting: 密度加权（突出稀疏的重要区域）
+    2. Dynamic Window Masking - 动态窗口掩码
+       - 限制attention范围，避免过拟合
+       - 类似局部感受野，关注邻近区域
     """
     
-    def __init__(self, dvs_channels, rgb_channels, fusion_channels=512, num_heads=8):
+    def __init__(self, dvs_channels, rgb_channels, fusion_channels=512, num_heads=8, 
+                 use_dim=True, use_dynamic_mask=True, mask_size=7):
         super().__init__()
         
         self.fusion_channels = fusion_channels
         self.num_heads = num_heads
+        self.use_dim = use_dim  # 是否使用DIM约束
+        self.use_dynamic_mask = use_dynamic_mask  # 是否使用动态窗口掩码
         
         # 特征对齐投影
         self.dvs_proj = SeqToANNContainer(nn.Conv2d(dvs_channels, fusion_channels, 1))
@@ -214,6 +220,10 @@ class CrossModalAttentionFusion(nn.Module):
             nn.Dropout(0.1)
         )
         
+        # 动态窗口掩码（需要在forward时根据实际空间尺寸创建）
+        self.mask_size = mask_size
+        self.attention_masks = {}  # 缓存不同尺寸的mask
+        
         self._init_weights()
     
     def _init_weights(self):
@@ -223,9 +233,44 @@ class CrossModalAttentionFusion(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
     
+    def _create_attention_mask(self, H: int, W: int, device) -> torch.Tensor:
+        """
+        创建动态窗口注意力掩码（参考ESEG Algorithm 2）
+        
+        Args:
+            H, W: 空间分辨率
+            device: 设备
+            
+        Returns:
+            mask: (HW, HW) 注意力掩码，窗口外为-1e4（softmax后接近0）
+        """
+        key = f"{H}x{W}"
+        if key in self.attention_masks:
+            return self.attention_masks[key]
+        
+        masks = torch.zeros(H * W, H * W, device=device)
+        half = self.mask_size // 2
+        
+        for q_x in range(H):
+            for q_y in range(W):
+                # 计算动态窗口范围
+                x0, x1 = max(0, q_x - half), min(H, q_x + half + 1)
+                y0, y1 = max(0, q_y - half), min(W, q_y + half + 1)
+                
+                # 创建局部窗口掩码
+                for kx in range(H):
+                    for ky in range(W):
+                        if x0 <= kx < x1 and y0 <= ky < y1:
+                            masks[q_x * W + q_y, kx * W + ky] = 0  # 窗口内
+                        else:
+                            masks[q_x * W + q_y, kx * W + ky] = -1e4  # 窗口外
+        
+        self.attention_masks[key] = masks
+        return masks
+    
     def forward(self, dvs_feat, rgb_feat):
         """
-        DVS动态查询RGB结构知识
+        DVS动态查询RGB结构知识 - 改进版（DIM + Dynamic Masking）
         
         Args:
             dvs_feat: (B, T, C_dvs, H, W) - DVS时序特征
@@ -240,30 +285,81 @@ class CrossModalAttentionFusion(nn.Module):
         dvs_aligned = self.dvs_proj(dvs_feat)  # (B, T, C, H, W)
         rgb_aligned = self.rgb_proj(rgb_feat).unsqueeze(1)  # (B, 1, C, H, W)
         
-        # Flatten spatial dimensions for attention
-        dvs_tokens = dvs_aligned.flatten(3).permute(0, 1, 3, 2)  # (B, T, HW, C)
-        rgb_tokens = rgb_aligned.flatten(3).permute(0, 1, 3, 2)  # (B, 1, HW, C)
-        rgb_tokens = rgb_tokens.repeat(1, T, 1, 1)  # (B, T, HW, C) 重复到每个时间步
+        # ====================================================================
+        # DIM (Density-aware Importance Modulation) - 参考ESEG Eq. 3-6
+        # ====================================================================
+        if self.use_dim:
+            # 展平时间维度计算DIM权重
+            dvs_2d = dvs_aligned.reshape(B * T, self.fusion_channels, H, W)
+            rgb_2d = rgb_aligned.expand(B, T, -1, -1, -1).reshape(B * T, self.fusion_channels, H, W)
+            
+            # 1. Similarity: 衡量RGB与DVS特征对齐程度 (Eq. 3)
+            l2_dvs = torch.norm(dvs_2d, p=2, dim=1, keepdim=True)
+            l2_rgb = torch.norm(rgb_2d, p=2, dim=1, keepdim=True)
+            dvs_norm = dvs_2d / (l2_dvs + 1e-6)
+            rgb_norm = rgb_2d / (l2_rgb + 1e-6)
+            
+            similarity = (dvs_norm * rgb_norm).sum(dim=1, keepdim=True)  # [-1, 1]
+            similarity = (similarity + 1) / 2  # 归一化到 [0, 1]
+            
+            # 2. Density: 突出稀疏的重要区域 (Eq. 4)
+            # DVS和事件数据通常稀疏，高密度区域更重要
+            density_dvs = torch.norm(dvs_2d, p=2, dim=1, keepdim=True)
+            density_flat = density_dvs.view(B * T, -1)
+            density_flat = F.softmax(density_flat, dim=1) * (H * W)  # 归一化并重缩放
+            density = density_flat.view(B * T, 1, H, W)
+            
+            # 应用DIM权重 (Eq. 5-6)
+            dvs_weighted = (dvs_2d * similarity).reshape(B * T, self.fusion_channels, H, W)
+            rgb_weighted = (rgb_2d * density).reshape(B * T, self.fusion_channels, H, W)
+            
+            # Reshape for attention
+            dvs_tokens = dvs_weighted.flatten(2).transpose(1, 2)  # (BT, HW, C)
+            rgb_tokens = rgb_weighted.flatten(2).transpose(1, 2)  # (BT, HW, C)
+        else:
+            # 不使用DIM，直接展平
+            dvs_tokens = dvs_aligned.flatten(3).permute(0, 1, 3, 2)  # (B, T, HW, C)
+            rgb_tokens = rgb_aligned.flatten(3).permute(0, 1, 3, 2)  # (B, 1, HW, C)
+            rgb_tokens = rgb_tokens.repeat(1, T, 1, 1)  # (B, T, HW, C)
+            
+            # Reshape for batch processing
+            dvs_tokens = dvs_tokens.reshape(B * T, H * W, self.fusion_channels)
+            rgb_tokens = rgb_tokens.reshape(B * T, H * W, self.fusion_channels)
         
-        # Reshape for batch processing: (B*T, HW, C)
-        dvs_flat = dvs_tokens.reshape(B * T, H * W, self.fusion_channels)
-        rgb_flat = rgb_tokens.reshape(B * T, H * W, self.fusion_channels)
-        
-        # Cross-Attention: DVS查询RGB
-        attn_out, attn_weights = self.cross_attn(
-            query=dvs_flat,      # DVS问：我需要什么？
-            key=rgb_flat,        # RGB答：我有什么结构
-            value=rgb_flat       # RGB给：对应的结构特征
-        )
+        # ====================================================================
+        # Cross-Attention with Dynamic Window Masking - 参考ESEG Eq. 7
+        # ====================================================================
+        if self.use_dynamic_mask:
+            # 创建动态窗口掩码
+            attn_mask = self._create_attention_mask(H, W, dvs_tokens.device)  # (HW, HW)
+            
+            # PyTorch的MultiheadAttention需要 (target_len, source_len) 格式
+            # 对于self-attention: (HW, HW)
+            # 需要扩展到每个batch: 不需要，会自动broadcast
+            
+            # Cross-Attention with mask
+            attn_out, attn_weights = self.cross_attn(
+                query=dvs_tokens,      # DVS问：我需要什么？(BT, HW, C)
+                key=rgb_tokens,        # RGB答：我有什么结构 (BT, HW, C)
+                value=rgb_tokens,      # RGB给：对应的结构特征 (BT, HW, C)
+                attn_mask=attn_mask    # 动态窗口掩码 (HW, HW)
+            )
+        else:
+            # 不使用动态掩码
+            attn_out, attn_weights = self.cross_attn(
+                query=dvs_tokens,
+                key=rgb_tokens,
+                value=rgb_tokens
+            )
         
         # Residual + Norm
-        dvs_flat = self.norm1(dvs_flat + attn_out)
+        dvs_tokens = self.norm1(dvs_tokens + attn_out)
         
         # Feed-Forward Network
-        dvs_flat = self.norm2(dvs_flat + self.ffn(dvs_flat))
+        dvs_tokens = self.norm2(dvs_tokens + self.ffn(dvs_tokens))
         
         # Reshape back to feature map
-        enhanced_dvs = dvs_flat.reshape(B, T, H, W, self.fusion_channels)
+        enhanced_dvs = dvs_tokens.reshape(B, T, H, W, self.fusion_channels)
         enhanced_dvs = enhanced_dvs.permute(0, 1, 4, 2, 3)  # (B, T, C, H, W)
         
         return enhanced_dvs
@@ -518,12 +614,22 @@ class EdgeGuidedVGGSNN(nn.Module):
                 spatial_size = spatial_sizes[stage_idx]
                 
                 if fusion_type == 'cross_attention':
-                    # 新的Cross-Attention融合
+                    # 新的Cross-Attention融合（带DIM和动态窗口掩码）
+                    # 动态窗口大小根据空间分辨率自适应调整
+                    # Stage 1: 16x16 -> mask=7
+                    # Stage 2: 8x8 -> mask=5
+                    # Stage 3: 4x4 -> mask=3
+                    # Stage 4: 2x2 -> mask=3 (最小3)
+                    mask_size = max(3, min(7, spatial_size // 2 + 1))
+                    
                     fusion = CrossModalAttentionFusion(
                         dvs_channels=feature_dims[stage_idx],
                         rgb_channels=feature_dims[stage_idx],
                         fusion_channels=feature_dims[stage_idx],
-                        num_heads=8
+                        num_heads=8,
+                        use_dim=True,  # 启用DIM约束
+                        use_dynamic_mask=True,  # 启用动态窗口掩码
+                        mask_size=mask_size
                     )
                 else:
                     # 旧的D2CAF融合
