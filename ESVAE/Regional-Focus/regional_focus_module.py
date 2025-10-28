@@ -474,7 +474,17 @@ class EnhancedVGGSNNWithRegionalFocus(nn.Module):
         self.pool4 = pool
         
         W = int(img_shape / 2 / 2 / 2 / 2)
-        self.bottleneck = SeqToANNContainer(nn.Linear(512 * W * W, 256))
+        # 动态计算瓶颈层输入维度，避免硬编码导致的维度不匹配
+        # 实际输入可能因为DVS转换等因素导致尺寸变化
+        expected_bottleneck_input = 512 * W * W
+        
+        # 添加自适应层来处理维度不匹配
+        self.adaptive_pool = SeqToANNContainer(nn.AdaptiveAvgPool2d((W, W)))
+        
+        # 使用延迟初始化的瓶颈层，在第一次前向传播时确定实际维度
+        self.bottleneck = None
+        self.expected_bottleneck_input = expected_bottleneck_input
+        self.W = W
         self.bottleneck_lif_node = LIFSpike()
         self.classifier = SeqToANNContainer(nn.Linear(256, cls_num))
         
@@ -572,9 +582,27 @@ class EnhancedVGGSNNWithRegionalFocus(nn.Module):
         x = self.pool4(x)
         features.append(x)  # 512维特征
         
-        # 瓶颈层
+        # 瓶颈层 - 使用自适应池化确保维度匹配
         x_before_flatten = x  # 保存flatten前的特征用于区域关注
+        
+        # 添加自适应池化以确保维度匹配
+        x = self.adaptive_pool(x)
+        
         x = torch.flatten(x, 2)
+        
+        # 动态初始化瓶颈层（如果还未初始化）
+        if self.bottleneck is None:
+            actual_input_dim = x.shape[-1]
+            
+            # 导入必要的层（在运行时导入以避免循环导入）
+            from TET__layer import SeqToANNContainer
+            
+            # 使用实际维度创建瓶颈层
+            self.bottleneck = SeqToANNContainer(nn.Linear(actual_input_dim, 256))
+            
+            # 将瓶颈层移动到正确的设备
+            self.bottleneck = self.bottleneck.to(x.device)
+        
         x = self.bottleneck(x)
         x, x_mem = self.bottleneck_lif_node(x, return_mem=True)
         # 注意：不将flatten后的特征添加到features中，因为它不是4D张量

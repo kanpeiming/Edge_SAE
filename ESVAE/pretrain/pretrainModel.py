@@ -38,7 +38,11 @@ class VGGSNN(nn.Module):
             pool,
         )
         W = int(img_shape / 2 / 2 / 2 / 2)
-        self.bottleneck = SeqToANNContainer(nn.Linear(512 * W * W, 256))
+        # Calculate the actual feature map size dynamically
+        # For 32x32 input with 4 pooling layers, we get 2x2, but actual might be different
+        # Use adaptive pooling to ensure consistent size
+        self.adaptive_pool = SeqToANNContainer(nn.AdaptiveAvgPool2d((2, 2)))
+        self.bottleneck = SeqToANNContainer(nn.Linear(512 * 2 * 2, 256))
         self.bottleneck_lif_node = LIFSpike()
         self.classifier = SeqToANNContainer(nn.Linear(256, cls_num))
 
@@ -84,12 +88,14 @@ class VGGSNN(nn.Module):
 
             # 提取高层特征
             source = self.features(source)
+            source = self.adaptive_pool(source)  # Ensure consistent 2x2 size
             source = torch.flatten(source, 2)
             source = self.bottleneck(source)
             source, source_mem = self.bottleneck_lif_node(source, return_mem=True)
             source_clf = self.classifier(source)
 
             target = self.features(target)
+            target = self.adaptive_pool(target)  # Ensure consistent 2x2 size
             target = torch.flatten(target, 2)
             target = self.bottleneck(target)
             target, target_mem = self.bottleneck_lif_node(target, return_mem=True)
@@ -117,6 +123,7 @@ class VGGSNN(nn.Module):
             else:
                 target, _ = self.dvs_input(target)
             target = self.features(target)
+            target = self.adaptive_pool(target)  # Ensure consistent 2x2 size
             target = torch.flatten(target, 2)
             target = self.bottleneck(target)
             target = self.bottleneck_lif_node(target)
