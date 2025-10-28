@@ -1,50 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-ESTL: Structure-Guided DVS Classification with Cross-Attention and Contrastive Learning
-DVS动态查询RGB结构知识，通过对比学习缓解样本量不匹配
+ESTL: N-Caltech101 DVS Classification - Baseline Module
+仅保留DVS分类基线训练
 
-核心特性:
-1. Cross-Attention融合: DVS主动查询RGB结构信息
-2. 对比学习: 拉近同类RGB-DVS特征，缓解样本量不匹配
-3. 支持更多epoch: DVS样本少(10k)，可训练200+ epoch
+核心功能:
+1. BaselineVGGSNN: DVS-only分类模型
+2. Caltech101数据加载器: 支持DVS-only和RGB+DVS配对
+3. 基线训练脚本: train_caltech101_baseline.py
 
-训练流程（三阶段）:
-=== 阶段1: 生成边缘数据集 ===
-python preprocess_edges.py
-
-=== 阶段2: RGB结构分支预训练 ===
-python pretrain_edge.py --epochs 50 --batch_size 64 --lr 0.001
-保存: /home/user/kpm/kpm/results/ESTL/edge-branch/checkpoints/best_edge_branch.pth
-
-=== 阶段3: 融合训练（Cross-Attention + 对比学习）===
-python train.py --epochs 200 --use_contrastive --contrastive_weight 0.3 \\
-    --pretrained_edge /path/to/best_edge_branch.pth --freeze_edge
-保存: /home/user/kpm/kpm/results/ESTL/fusion/checkpoints/
+使用方法:
+=== DVS-only基线训练 ===
+python train_caltech101_baseline.py --epochs 150 --batch_size 16 --lr 0.001
 """
 
-from .models import (
-    EdgeGuidedVGGSNN,
-    BaselineVGGSNN,
-    SNND2CAFFusion,
-    CrossModalAttentionFusion,
-    VGGEdgeBranch,
-    VGGDVSBranch
+from .models import BaselineVGGSNN, BaselineSpikformer
+from .caltech101_dataloader import (
+    get_caltech101_dvs_only_dataloaders,
+    get_caltech101_dataloaders,
+    Caltech101DVSOnlyDataset,
+    Caltech101Dataset
 )
 
-from .trainer import EdgeGuidedTrainer, ContrastiveLoss
-from .edge_pretrainer import EdgePretrainer
-
 __all__ = [
-    'EdgeGuidedVGGSNN',
     'BaselineVGGSNN',
-    'SNND2CAFFusion',
-    'CrossModalAttentionFusion',
-    'VGGEdgeBranch',
-    'VGGDVSBranch',
-    'EdgeGuidedTrainer',
-    'ContrastiveLoss',
-    'EdgePretrainer',
+    'BaselineSpikformer',
+    'get_caltech101_dvs_only_dataloaders',
+    'get_caltech101_dataloaders',
+    'Caltech101DVSOnlyDataset',
+    'Caltech101Dataset',
 ]
 
-__version__ = '3.0.0'
-__author__ = 'Based on ESEG framework'
+__version__ = '1.0.0'
+__author__ = 'Based on ESVAE framework'

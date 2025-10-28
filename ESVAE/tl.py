@@ -6,6 +6,10 @@
 @time: 2022/4/19 11:11
 """
 
+'''
+加载预训练参数，利用纯DVS数据进行分类。
+'''
+
 import os
 import torch
 import argparse

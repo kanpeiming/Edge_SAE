@@ -1,0 +1,86 @@
+# ESTL 模块开发规则
+# Development Rules for ESTL Module
+# ============================================================================
+
+## 代码开发规范 (Code Development Guidelines)
+
+### 1. 测试文件 (Test Files)
+- ❌ 不要生成测试文件
+- ❌ Do NOT generate test files
+- ✅ 仅实现代码功能即可
+- ✅ Only implement functional code
+
+### 2. 文档文件 (Documentation Files)
+- ❌ 不要创建 Markdown 文档 (.md)
+- ❌ Do NOT create Markdown documentation files
+- ⚠️  除非用户主动要求
+- ⚠️  Unless explicitly requested by user
+
+### 3. 命令行操作 (Terminal Commands)
+- ❌ 不要运行命令行指令
+- ❌ Do NOT run terminal commands
+- 📝 代码在服务器上运行
+- 📝 Code runs on server environment
+- ⚠️  仅在用户明确要求时执行命令
+- ⚠️  Only execute commands when explicitly requested
+
+### 4. 代码结构 (Code Structure)
+- ✅ 代码结构要清晰
+- ✅ Code structure must be clear and organized
+- ✅ 可以自主创建子包/模块
+- ✅ Can create sub-packages/modules as needed
+- ✅ 遵循 Python 最佳实践
+- ✅ Follow Python best practices
+
+## 目录结构建议 (Suggested Directory Structure)
+
+```
+ESTL/
+├── .dev_rules                    # 本文件 (This file)
+├── __init__.py                   # 模块初始化
+├── models.py                     # 基线模型
+├── caltech101_dataloader.py     # 数据加载器
+├── train_caltech101_baseline.py # 基线训练脚本
+│
+├── vlm/                          # VLM相关功能 (新增)
+│   ├── __init__.py
+│   ├── feature_extractor.py     # VLM特征提取
+│   ├── semantic_edge.py         # 语义边缘生成
+│   └── vlm_guided_trainer.py    # VLM引导训练器
+│
+├── preprocessing/                # 预处理脚本 (新增)
+│   ├── __init__.py
+│   ├── extract_vlm_features.py  # 提取VLM特征
+│   └── generate_semantic_edges.py # 生成语义边缘
+│
+└── utils/                        # 工具函数 (新增)
+    ├── __init__.py
+    ├── visualization.py          # 可视化工具
+    └── io_utils.py               # IO工具
+```
+
+## 开发流程 (Development Workflow)
+
+1. **需求确认**: 先确认功能需求,再开始编码
+2. **模块化设计**: 将功能拆分为独立的模块
+3. **代码复用**: 尽可能复用现有代码
+4. **注释清晰**: 中英文注释,说明关键逻辑
+5. **渐进式开发**: 先核心功能,再扩展功能
+
+## 注意事项 (Important Notes)
+
+- 所有新增代码必须与现有代码风格保持一致
+- 优先考虑代码的可维护性和可读性
+- 避免引入不必要的依赖
+- 确保代码在服务器环境下可运行
+
+## 更新日志 (Update Log)
+
+- 2025-01-24: 创建开发规则文件
+- 规则来源: 用户明确要求
+
+============================================================================
+# 请在开发过程中严格遵守以上规则
+# Please strictly follow the above rules during development
+============================================================================
+

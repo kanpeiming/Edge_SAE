@@ -3,6 +3,7 @@ import gc
 import time
 import torch
 import itertools
+from tqdm import tqdm
 from tl_utils.common_utils import LapPoissonEncoder, MyPoissonEncoder, TimeEncoder, accuracy
 
 try:
@@ -382,7 +383,7 @@ class AlignmentTLTrainer_Edge_1(TLTrainer):
         for epoch in range(self.args.epochs):
             self.network.train()
             start = time.time()
-            train_num = 1
+            train_num = 0
             total_loss = 0
             source_train_loss = 0
             source_train_correct = 0
@@ -393,7 +394,12 @@ class AlignmentTLTrainer_Edge_1(TLTrainer):
             total_encoder_tl_loss = 0
             total_feature_tl_loss = 0
 
-            for i, (data, labels) in enumerate(train_loader):  # 单次加载
+            # 创建进度条
+            pbar = tqdm(enumerate(train_loader), total=len(train_loader),
+                       desc=f'Epoch [{epoch+1}/{self.args.epochs}]',
+                       ncols=120)
+
+            for i, (data, labels) in pbar:  # 单次加载
                 self.optimizer.zero_grad()
 
                 # 先将 source_data = data，接着进行边缘提取
@@ -448,13 +454,6 @@ class AlignmentTLTrainer_Edge_1(TLTrainer):
 
                 train_num += float(labels.size(0))
 
-                # 统计第一指标
-                # _, source_predicted = source_mean_out.cpu().max(1)
-                # source_train_correct += float(source_predicted.eq(labels.cpu()).sum().item())
-                #
-                # _, target_predicted = target_mean_out.cpu().max(1)
-                # target_train_correct += float(target_predicted.eq(labels.cpu()).sum().item())
-
                 # 使用 accuracy 计算 top1 和 top5（top5 在两处统计）
                 source_acc1, source_acc5 = accuracy(source_mean_out, labels, topk=(1, 5))
                 target_acc1, target_acc5 = accuracy(target_mean_out, labels, topk=(1, 5))
@@ -463,7 +462,20 @@ class AlignmentTLTrainer_Edge_1(TLTrainer):
                 target_train_correct += target_acc1
                 target_train_correct5 += target_acc5
 
+                # 更新进度条信息
+                current_avg_loss = total_loss / train_num
+                current_rgb_acc = source_train_correct / train_num
+                current_edge_acc = target_train_correct / train_num
+                pbar.set_postfix({
+                    'Loss': f'{current_avg_loss:.4f}',
+                    'RGB_Acc': f'{current_rgb_acc:.3f}',
+                    'Edge_Acc': f'{current_edge_acc:.3f}'
+                })
+
                 reset_net(self.network)
+
+            # 关闭进度条
+            pbar.close()
 
             # 更新学习率每个 epoch 完成后
             self.scheduler.step()
@@ -487,7 +499,7 @@ class AlignmentTLTrainer_Edge_1(TLTrainer):
                   'target_clf_loss={:.5f} target_train_acc1={:.4f} target_train_acc5={:.4f} '
                   'total_loss={:.5f} total_acc1={:.4f} total_acc5={:.4f} '
                   'encoder_tl_loss={:.5f} feature_tl_loss={:.5f}'.format(
-                epoch, self.args.epochs, (time.time() - start) / 60,
+                epoch+1, self.args.epochs, (time.time() - start) / 60,
                 source_train_loss, source_train_acc1, source_train_acc5,
                 target_train_loss, target_train_acc1, target_train_acc5,
                 total_loss, total_acc, total_acc5,
@@ -497,9 +509,197 @@ class AlignmentTLTrainer_Edge_1(TLTrainer):
             if total_loss < self.best_total_loss:
                 self.best_total_loss = total_loss
                 self.best_train_acc = total_acc  # 最佳准确率
-                self.save_model_best(epoch)
+                self.save_model_best(epoch+1)
 
             # 记录训练相关日志（验证相关日志已移除）
+            self.writer.add_scalar(tag="train/source_accuracy1", scalar_value=source_train_acc1, global_step=epoch)
+            self.writer.add_scalar(tag="train/source_accuracy5", scalar_value=source_train_acc5, global_step=epoch)
+            self.writer.add_scalar(tag="train/source_loss", scalar_value=source_train_loss, global_step=epoch)
+            self.writer.add_scalar(tag="train/target_accuracy1", scalar_value=target_train_acc1, global_step=epoch)
+            self.writer.add_scalar(tag="train/target_accuracy5", scalar_value=target_train_acc5, global_step=epoch)
+            self.writer.add_scalar(tag="train/target_loss", scalar_value=target_train_loss, global_step=epoch)
+            self.writer.add_scalar(tag="train/accuracy1", scalar_value=total_acc, global_step=epoch)
+            self.writer.add_scalar(tag="train/accuracy5", scalar_value=total_acc5, global_step=epoch)
+            self.writer.add_scalar(tag="train/loss", scalar_value=total_loss, global_step=epoch)
+            self.writer.add_scalar(tag="train/encoder_tl_loss", scalar_value=total_encoder_tl_loss, global_step=epoch)
+            self.writer.add_scalar(tag="train/feature_tl_loss", scalar_value=total_feature_tl_loss, global_step=epoch)
+            self.writer.add_scalar(tag="train/lr", scalar_value=self.optimizer.param_groups[0]['lr'], global_step=epoch)
+
+            # 打印内存信息
+            info = psutil.virtual_memory()
+            print(info)
+            print(u'电脑总内存：%.4f GB' % (info.total / 1024 / 1024 / 1024))
+            print(u'available：%.4f GB' % (info.available / 1024 / 1024 / 1024))
+            print(u'used：%.4f GB' % (info.used / 1024 / 1024 / 1024))
+            print(u'free：%.4f GB' % (info.free / 1024 / 1024 / 1024))
+            print(u'当前使用的总内存占比：', info.percent)
+            print("------------------------------------------------------")
+
+        return self.best_train_acc, self.best_total_loss
+
+
+class AlignmentTLTrainer_RGB2DVS(TLTrainer):
+    """
+    RGB到DVS的迁移学习训练器
+    从RGB图像中学习知识，并将其迁移到DVS数据上
+    """
+    def __init__(self, args, device, writer, network, optimizer, criterion, scheduler, model_path):
+        super().__init__(args, device, writer, network, optimizer, criterion, scheduler, model_path)
+        self.best_total_loss = float('inf')
+        self.best_model_path = os.path.join(model_path, "best_model.pth")
+
+    def save_model_best(self, epoch):
+        """保存当前最佳模型"""
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': self.network.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'loss': self.best_total_loss,
+        }, self.best_model_path)
+        print(f"Best model saved at epoch {epoch} with loss {self.best_total_loss:.5f}")
+
+    def train(self, train_loader):
+        """
+        训练函数：处理同时包含RGB和DVS数据的loader
+        train_loader返回: ((rgb_img, dvs_img), label)
+        """
+        for epoch in range(self.args.epochs):
+            self.network.train()
+            start = time.time()
+            train_num = 0
+            total_loss = 0
+            source_train_loss = 0
+            source_train_correct = 0
+            source_train_correct5 = 0
+            target_train_loss = 0
+            target_train_correct = 0
+            target_train_correct5 = 0
+            total_encoder_tl_loss = 0
+            total_feature_tl_loss = 0
+
+            # 创建进度条
+            pbar = tqdm(enumerate(train_loader), total=len(train_loader), 
+                       desc=f'Epoch [{epoch+1}/{self.args.epochs}]',
+                       ncols=120)
+
+            for i, (data, labels) in pbar:
+                self.optimizer.zero_grad()
+
+                # 解包数据: data是(rgb_img, dvs_img)的元组
+                source_data, target_data = data  # source是RGB, target是DVS
+
+                # 编码处理
+                # RGB数据: (N, 3, H, W) -> (N, T, 3, H, W)
+                if source_data.shape[1] == 3:
+                    source_data = self.encoder_dict[self.args.encoder_type](source_data)
+                
+                # DVS数据已经是(N, T, 2, H, W)格式，无需编码
+                # 但如果是其他格式需要处理
+                if len(target_data.shape) == 4:  # (N, 2, H, W)
+                    # 需要添加时间维度
+                    target_data = target_data.unsqueeze(1).repeat(1, self.args.T, 1, 1, 1)
+
+                # 数据转移到设备
+                source_data, labels = source_data.to(self.device), labels.to(self.device)
+                target_data = target_data.to(self.device)
+
+                # 前向传播
+                source_outputs, target_outputs, encoder_tl_loss, feature_tl_loss = self.network(
+                    source_data.float(),
+                    target_data.float(),
+                    self.args.encoder_tl_loss_type,
+                    self.args.feature_tl_loss_type
+                )
+
+                # 计算分类损失
+                source_mean_out = source_outputs.mean(1)  # (N, num_classes)
+                source_clf_loss = self.criterion(source_outputs, labels)
+
+                target_mean_out = target_outputs.mean(1)  # (N, num_classes)
+                target_clf_loss = self.criterion(target_outputs, labels)
+
+                # 总损失
+                loss = source_clf_loss + target_clf_loss
+
+                if self.args.encoder_tl_lamb > 0.0:
+                    loss = loss + self.args.encoder_tl_lamb * encoder_tl_loss
+                if self.args.feature_tl_lamb > 0.0:
+                    loss = loss + self.args.feature_tl_lamb * feature_tl_loss
+
+                # 累积损失
+                source_train_loss += source_clf_loss.item()
+                target_train_loss += target_clf_loss.item()
+                total_encoder_tl_loss += encoder_tl_loss.item()
+                total_feature_tl_loss += feature_tl_loss.item()
+                total_loss += loss.item()
+
+                # 反向传播
+                loss.mean().backward()
+                self.optimizer.step()
+
+                train_num += float(labels.size(0))
+
+                # 计算准确率 (top1 和 top5)
+                source_acc1, source_acc5 = accuracy(source_mean_out, labels, topk=(1, 5))
+                target_acc1, target_acc5 = accuracy(target_mean_out, labels, topk=(1, 5))
+                source_train_correct += source_acc1
+                source_train_correct5 += source_acc5
+                target_train_correct += target_acc1
+                target_train_correct5 += target_acc5
+
+                # 更新进度条信息
+                current_avg_loss = total_loss / train_num
+                current_rgb_acc = source_train_correct / train_num
+                current_dvs_acc = target_train_correct / train_num
+                pbar.set_postfix({
+                    'Loss': f'{current_avg_loss:.4f}',
+                    'RGB_Acc': f'{current_rgb_acc:.3f}',
+                    'DVS_Acc': f'{current_dvs_acc:.3f}'
+                })
+
+                # 重置网络状态
+                reset_net(self.network)
+
+            # 关闭进度条
+            pbar.close()
+
+            # 更新学习率
+            self.scheduler.step()
+
+            # 计算平均值
+            source_train_acc1 = source_train_correct / train_num
+            target_train_acc1 = target_train_correct / train_num
+            total_acc = (source_train_acc1 + target_train_acc1) / 2
+
+            source_train_acc5 = source_train_correct5 / train_num
+            target_train_acc5 = target_train_correct5 / train_num
+            total_acc5 = (source_train_acc5 + target_train_acc5) / 2
+
+            source_train_loss = source_train_loss / train_num
+            target_train_loss = target_train_loss / train_num
+            total_encoder_tl_loss = total_encoder_tl_loss / train_num
+            total_feature_tl_loss = total_feature_tl_loss / train_num
+            total_loss = total_loss / train_num
+
+            # 打印训练信息
+            print('Epoch:[{}/{}] time cost: {:.2f}min '
+                  'source_clf_loss={:.5f} source_train_acc1={:.4f} source_train_acc5={:.4f} '
+                  'target_clf_loss={:.5f} target_train_acc1={:.4f} target_train_acc5={:.4f} '
+                  'total_loss={:.5f} total_acc1={:.4f} total_acc5={:.4f} '
+                  'encoder_tl_loss={:.5f} feature_tl_loss={:.5f}'.format(
+                epoch+1, self.args.epochs, (time.time() - start) / 60,
+                source_train_loss, source_train_acc1, source_train_acc5,
+                target_train_loss, target_train_acc1, target_train_acc5,
+                total_loss, total_acc, total_acc5,
+                total_encoder_tl_loss, total_feature_tl_loss))
+
+            # 保存最佳模型
+            if total_loss < self.best_total_loss:
+                self.best_total_loss = total_loss
+                self.best_train_acc = total_acc
+                self.save_model_best(epoch+1)
+
+            # 记录训练日志
             self.writer.add_scalar(tag="train/source_accuracy1", scalar_value=source_train_acc1, global_step=epoch)
             self.writer.add_scalar(tag="train/source_accuracy5", scalar_value=source_train_acc5, global_step=epoch)
             self.writer.add_scalar(tag="train/source_loss", scalar_value=source_train_loss, global_step=epoch)

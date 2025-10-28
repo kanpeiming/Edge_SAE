@@ -9,9 +9,7 @@
 import os
 import bisect
 from collections import Counter
-# 13行的导入有一些问题
-# _utils 856行,可能是torch2.4.1没有这种方法，因此在本文档中定义
-# from torch._utils import _accumulate
+from torch._utils import _accumulate
 from dataloader.dataloader_utils import *
 from torch.utils.data.dataset import Subset
 from torchvision import datasets, transforms
@@ -20,117 +18,58 @@ from typing import Any, Callable, Optional, Tuple
 from torch.utils.data import Dataset, random_split
 from torch.utils.data.sampler import SubsetRandomSampler
 
+
 # your own data dir
-USER_NAME = 'kpm'
-DIR = {'CIFAR10': f'/home/user/{USER_NAME}/kpm/Dataset/CIFAR10/cifar10',
-       'CIFAR10DVS': f'/home/user/Datasets/CIFAR10/CIFAR10DVS/temporal_effecient_training_0.9_mat',
-       'CIFAR10DVS_CATCH': f'/home/user/{USER_NAME}/kpm/Dataset/CIFAR10/CIFAR10DVS_dst_cache',
+USER_NAME = 'tr'
+DIR = {'CIFAR10': f'/home/user/{USER_NAME}/Dataset/Event_Camera_Datasets/CIFAR10/cifar10',
+       'CIFAR10DVS': f'/home/user/{USER_NAME}/Dataset/Event_Camera_Datasets/CIFAR10/CIFAR10DVS/temporal_effecient_training_0.9_mat',
+       'CIFAR10DVS_CATCH': f'/home/user/{USER_NAME}/Dataset/Event_Camera_Datasets/CIFAR10/CIFAR10DVS_dst_cache',
        }
 
 
-def _accumulate(iterable, fn=lambda x, y: x + y):
-    "Return running totals"
-    # _accumulate([1,2,3,4,5]) --> 1 3 6 10 15
-    # _accumulate([1,2,3,4,5], operator.mul) --> 1 2 6 24 120
-    it = iter(iterable)
-    try:
-        total = next(it)
-    except StopIteration:
-        return
-    yield total
-    for element in it:
-        total = fn(total, element)
-        yield total
-
-
-def get_tl_cifar10(batch_size, train_set_ratio=1.0, dvs_train_set_ratio=1.0, val_ratio=0.1, use_cutout=False, cutout_length=16):
+def get_tl_cifar10(batch_size, train_set_ratio=1.0, dvs_train_set_ratio=1.0):
     """
-    获取RGB到DVS迁移学习的CIFAR10数据加载器
-    
-    Args:
-        batch_size: 批次大小
-        train_set_ratio: RGB训练集使用比例
-        dvs_train_set_ratio: DVS训练集使用比例
-        val_ratio: 验证集比例（从DVS训练集中划分）
-    
-    Returns:
-        train_dataloader: 训练数据加载器（RGB+DVS配对数据，用于迁移学习）
-        val_dataloader: 验证数据加载器（仅DVS数据，用于验证DVS分类性能）
-        test_dataloader: 测试数据加载器（仅DVS数据）
+    get the train loader which yield rgb_img and dvs_img with label
+    and test loader which yield dvs_img with label of cifar10.
+    :return: train_loader, test_loader
     """
-    # 构建RGB训练变换序列 - 回退到32×32避免瓶颈层维度问题
-    rgb_transforms = [
-        transforms.Resize(32),
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),  # 随机水平翻转
-        CIFAR10Policy(),  # AutoAugment策略
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),  # 归一化
-    ]
-    
-    # 可选添加Cutout数据增强
-    if use_cutout:
-        rgb_transforms.append(Cutout(n_holes=1, length=cutout_length))
-        
-    rgb_trans_train = transforms.Compose(rgb_transforms)
+    rgb_trans_train = transforms.Compose([transforms.Resize(48),
+                                          transforms.RandomCrop(48, padding=4),
+                                          transforms.RandomHorizontalFlip(),  # 随机水平翻转
+                                          CIFAR10Policy(),  # TODO: 待注释
+                                          transforms.ToTensor(),
+                                          # transforms.RandomGrayscale(),  # 随机变为灰度图
+                                          transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),  # 归一化
+                                          # transforms.Normalize((0., 0., 0.), (1, 1, 1)),
+                                          # Cutout(n_holes=1, length=16)  # 随机挖n_holes个length * length的洞
+                                          ])
     # rgb_trans_test = transforms.Compose([transforms.Resize(48),
     #                                  transforms.ToTensor(),
     #                                  transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))])
-    dvs_trans = transforms.Compose([transforms.Resize((32, 32)),
-                                    # transforms.RandomCrop(32, padding=4),
+    dvs_trans = transforms.Compose([transforms.Resize((48, 48)),
+                                    # transforms.RandomCrop(48, padding=4),
                                     # transforms.RandomHorizontalFlip(),  # 随机水平翻转
                                     transforms.ToTensor(),
                                    ])
 
-    # 创建迁移学习训练数据（RGB+DVS配对）
     tl_train_data = TLCIFAR10(DIR['CIFAR10'], DIR['CIFAR10DVS'], train=True, dvs_train_set_ratio=dvs_train_set_ratio,
                               transform=rgb_trans_train, dvs_transform=dvs_trans, download=True)
-    
-    # 按train_set_ratio划分RGB训练集
+    dvs_test_data = TLCIFAR10(DIR['CIFAR10'], DIR['CIFAR10DVS'], train=False, dvs_train_set_ratio=1.0,
+                              dvs_transform=dvs_trans, download=True)
+
+    # take train set by train_set_ratio
     if train_set_ratio < 1.0:
-        n_train = len(tl_train_data)
-        split = int(n_train * train_set_ratio)
+        n_train = len(tl_train_data)  # 60000
+        split = int(n_train * train_set_ratio)  # 60000*0.9 = 54000
         print(n_train, split)
-        tl_train_data = my_random_split(tl_train_data, [split, n_train - split],
-                                        generator=torch.Generator().manual_seed(1000))
+        tl_train_data, _ = my_random_split(tl_train_data, [split, n_train-split], generator=torch.Generator().manual_seed(1000))
 
-    # 创建纯DVS数据集用于验证和测试
-    # DVS验证集：从DVS训练数据中划分
-    dvs_train_full = DVSCifar10v1(os.path.join(DIR['CIFAR10DVS'], 'train'), train=True, transform=True)
-    dvs_test_data = DVSCifar10v1(os.path.join(DIR['CIFAR10DVS'], 'test'), train=False, transform=False)
-    
-    # 按dvs_train_set_ratio划分DVS训练集
-    if dvs_train_set_ratio < 1.0:
-        n_dvs_train = len(dvs_train_full)
-        dvs_split = int(n_dvs_train * dvs_train_set_ratio)
-        dvs_train_full = my_random_split(dvs_train_full, [dvs_split, n_dvs_train - dvs_split],
-                                        generator=torch.Generator().manual_seed(1000))
-    
-    # 从DVS训练集中划分验证集
-    n_dvs_train_final = len(dvs_train_full)
-    n_dvs_val = int(n_dvs_train_final * val_ratio)
-    n_dvs_train_actual = n_dvs_train_final - n_dvs_val
-    
-    print(f"DVS数据划分: 总数={n_dvs_train_final}, 训练={n_dvs_train_actual}, 验证={n_dvs_val}")
-    
-    dvs_train_data, dvs_val_data = my_random_split(
-        dvs_train_full,
-        [n_dvs_train_actual, n_dvs_val],
-        generator=torch.Generator().manual_seed(1000)
-    )
-
-    # 创建数据加载器
-    # 训练：RGB+DVS配对数据，用于迁移学习
     train_dataloader = DataLoaderX(tl_train_data, batch_size=batch_size, shuffle=True, num_workers=8, drop_last=True,
                                    pin_memory=True)
-    # 验证：纯DVS数据，用于验证DVS分类性能
-    val_dataloader = DataLoaderX(dvs_val_data, batch_size=batch_size, shuffle=False, num_workers=8, drop_last=False,
-                                 pin_memory=True)
-    # 测试：纯DVS数据
     test_dataloader = DataLoaderX(dvs_test_data, batch_size=batch_size, shuffle=False, num_workers=8, drop_last=False,
                                   pin_memory=True)
 
-    return train_dataloader, val_dataloader, test_dataloader
+    return train_dataloader, test_dataloader
 
 
 def get_cifar10(batch_size, train_set_ratio=1.0):
@@ -138,8 +77,8 @@ def get_cifar10(batch_size, train_set_ratio=1.0):
     get the train loader and test loader of cifar10.
     :return: train_loader, test_loader
     """
-    trans_train = transforms.Compose([transforms.Resize(32),
-                                      transforms.RandomCrop(32, padding=4),
+    trans_train = transforms.Compose([transforms.Resize(48),
+                                      transforms.RandomCrop(48, padding=4),
                                       transforms.RandomHorizontalFlip(),  # 随机水平翻转
                                       CIFAR10Policy(),  # TODO: 待注释
                                       transforms.ToTensor(),
@@ -148,7 +87,7 @@ def get_cifar10(batch_size, train_set_ratio=1.0):
                                       # transforms.Normalize((0., 0., 0.), (1, 1, 1)),
                                       # Cutout(n_holes=1, length=16)  # 随机挖n_holes个length * length的洞
                                       ])
-    trans_test = transforms.Compose([transforms.Resize(32),
+    trans_test = transforms.Compose([transforms.Resize(48),
                                      transforms.ToTensor(),
                                      transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))])
 
@@ -171,10 +110,10 @@ def get_cifar10(batch_size, train_set_ratio=1.0):
     test_dataloader = DataLoaderX(test_data, batch_size=batch_size, shuffle=True, num_workers=8, drop_last=False,
                                   pin_memory=True)
 
-    return train_dataloader  # , test_dataloader
+    return train_dataloader, test_dataloader
 
 
-def get_cifar10_DVS(batch_size, T, split_ratio=0.9, train_set_ratio=1, size=32, encode_type='TET'):
+def get_cifar10_DVS(batch_size, T, split_ratio=0.9, train_set_ratio=1, size=48, encode_type='TET'):
     """
     get the train loader and test loader of cifar10.
     :param batch_size:
@@ -204,13 +143,13 @@ def get_cifar10_DVS(batch_size, T, split_ratio=0.9, train_set_ratio=1, size=32, 
             torch.save(train_set, train_set_pth)
             torch.save(test_set, test_set_pth)
     elif encode_type == "TET":
-        path = '/home/user/Datasets/CIFAR10/CIFAR10DVS/temporal_effecient_training_0.9_mat'
+        path = '/data/zhan/Event_Camera_Datasets/CIFAR10/CIFAR10DVS/temporal_effecient_training_0.9_mat'
         train_path = path + '/train'
         test_path = path + '/test'
-        train_set = DVSCifar10v1(root=train_path)
-        test_set = DVSCifar10v1(root=test_path)
+        train_set = DVSCifar10(root=train_path)
+        test_set = DVSCifar10(root=test_path)
     elif encode_type == "3_channel":
-        path = '/home/user/Datasets/CIFAR10/CIFAR10DVS/temporal_effecient_training_0.9_mat'
+        path = '/data/zhan/Event_Camera_Datasets/CIFAR10/CIFAR10DVS/temporal_effecient_training_0.9_mat'
         train_path = path + '/train'
         test_path = path + '/test'
         train_set = Channel_3_DVSCifar10(root=train_path)
@@ -227,7 +166,7 @@ def get_cifar10_DVS(batch_size, T, split_ratio=0.9, train_set_ratio=1, size=32, 
     # generate dataloader
     # train_data_loader = DataLoaderX(dataset=train_set, batch_size=batch_size, shuffle=True, drop_last=True,
     #                                 num_workers=8, pin_memory=True)
-    train_data_loader = DataLoaderX(dataset=train_set, batch_size=batch_size, shuffle=False, drop_last=False,
+    train_data_loader = DataLoaderX(dataset=train_set, batch_size=batch_size, shuffle=False, drop_last=True,
                                     sampler=train_sampler, num_workers=8,
                                     pin_memory=True)  # SubsetRandomSampler 自带shuffle，不能重复使用
     test_data_loader = DataLoaderX(dataset=test_set, batch_size=batch_size, shuffle=False, drop_last=False,
@@ -268,7 +207,7 @@ class DVSCifar10(Dataset):
         self.transform = transform
         self.target_transform = target_transform
         self.train = train
-        self.resize = transforms.Resize(size=(32, 32))  # 32 32
+        self.resize = transforms.Resize(size=(48, 48))  # 48 48
         self.tensorx = transforms.ToTensor()
         self.imgx = transforms.ToPILImage()
 
@@ -279,7 +218,7 @@ class DVSCifar10(Dataset):
         Returns:
             tuple: (image, target) where target is index of the target class.
         """
-        data, target = torch.load(self.root + '/{}_mat.pt'.format(index))
+        data, target = torch.load(self.root + '/{}.pt'.format(index))
         # if self.train:
         new_data = []
         for t in range(data.size(0)):
@@ -301,65 +240,13 @@ class DVSCifar10(Dataset):
         return len(os.listdir(self.root))
 
 
-class DVSCifar10v1(Dataset):
-    def __init__(self, root, train=True, transform=True, target_transform=None):
-        self.root = os.path.expanduser(root)
-        self.transform = transform
-        self.target_transform = target_transform
-        self.train = train
-        self.resize = transforms.Resize(size=(48, 48))
-        self.tensorx = transforms.ToTensor()
-        self.imgx = transforms.ToPILImage()
-
-        # 构建索引映射：每个元素是（文件路径, 类别标签）
-        self.samples = []
-        self.class_to_idx = {}
-        self._build_index()
-
-    def _build_index(self):
-        class_dirs = sorted(os.listdir(self.root))
-        for label_idx, class_dir in enumerate(class_dirs):
-            class_path = os.path.join(self.root, class_dir)
-            if os.path.isdir(class_path):
-                self.class_to_idx[class_dir] = label_idx
-                for filename in os.listdir(class_path):
-                    if filename.endswith('.pt'):
-                        filepath = os.path.join(class_path, filename)
-                        self.samples.append((filepath, label_idx))
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, index):
-        filepath, label = self.samples[index]  # label 已从文件夹名称映射
-        data = torch.load(filepath, weights_only=True)  # 直接加载张量
-        target = label  # 标签来自文件夹名称
-        # 如果 data 是视频帧或多帧数据，处理每一帧
-        new_data = []
-        for t in range(data.size(0)):
-            new_data.append(self.tensorx(self.resize(self.imgx(data[t, ...]))))
-        data = torch.stack(new_data, dim=0)
-
-        if self.transform:
-            flip = random.random() > 0.5
-            if flip:
-                data = torch.flip(data, dims=(3,))
-            off1 = random.randint(-5, 5)
-            off2 = random.randint(-5, 5)
-            data = torch.roll(data, shifts=(off1, off2), dims=(2, 3))
-
-        if self.target_transform is not None:
-            target = self.target_transform(target)
-        return data, torch.tensor(target)
-
-
 class Channel_3_DVSCifar10(Dataset):
     def __init__(self, root, train=True, transform=True, target_transform=None):
         self.root = os.path.expanduser(root)
         self.transform = transform
         self.target_transform = target_transform
         self.train = train
-        self.resize = transforms.Resize(size=(32, 32))  # 32 32
+        self.resize = transforms.Resize(size=(48, 48))  # 48 48
         self.tensorx = transforms.ToTensor()
         self.imgx = transforms.ToPILImage()
 
@@ -472,7 +359,6 @@ class TLCIFAR10(datasets.CIFAR10):
         """
         准备DVS数据
         """
-        print(self.dvs_root)
         dvs_class_list = sorted(os.listdir(self.dvs_root))
         self.dvs_data = []
         self.dvs_targets = []
@@ -512,18 +398,17 @@ class TLCIFAR10(datasets.CIFAR10):
             dvs_index_start = self.dvs_cumulative_sizes[dataset_idx - 1]  # 得到该类别对应dvs图像的开始索引
             dvs_index_end = self.dvs_cumulative_sizes[dataset_idx]  # 得到该类别对应dvs图像的结束索引
             dvs_index = dvs_index_start + (index - self.cumulative_sizes[dataset_idx - 1]) % (
-                int((
-                            dvs_index_end - dvs_index_start) * self.dvs_train_set_ratio))  # 利用求余，得到在该类别循环0次或多次后的最终索引，self.dvs_train_set_ratio可控制选取dvs图像的比例
+                int((dvs_index_end - dvs_index_start) * self.dvs_train_set_ratio))  # 利用求余，得到在该类别循环0次或多次后的最终索引，self.dvs_train_set_ratio可控制选取dvs图像的比例
 
             # dvs图像的transform
-            dvs_img = torch.load(self.dvs_data[dvs_index], weights_only=True)
+            dvs_img = torch.load(self.dvs_data[dvs_index])
             if self.dvs_transform is not None:
                 dvs_img = self.dvs_trans(dvs_img)
 
             return (img, dvs_img), target
         else:
             # dvs图像的transform
-            dvs_img = torch.load(self.dvs_data[index], weights_only=True)
+            dvs_img = torch.load(self.dvs_data[index])
             if self.dvs_transform is not None:
                 dvs_img = self.dvs_trans(dvs_img)
             target = self.dvs_targets[index]  # 输入索引对应dvs图像的类别
@@ -588,5 +473,4 @@ def my_random_split(dataset, lengths, generator):
         raise ValueError("Sum of input lengths does not equal the length of the input dataset!")
 
     indices = torch.randperm(sum(lengths), generator=generator).tolist()
-    return [MySubset(dataset, indices[offset - length: offset]) for offset, length in
-            zip(_accumulate(lengths), lengths)]
+    return [MySubset(dataset, indices[offset - length : offset]) for offset, length in zip(_accumulate(lengths), lengths)]
