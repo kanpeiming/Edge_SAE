@@ -437,14 +437,14 @@ class EnhancedVGGSNNWithRegionalFocus(nn.Module):
     增强的VGGSNN：集成分层区域聚焦机制
     
     关键改进：
-    1. DVS输入从2通道改为3通道（两通道各取0.5堆叠到第三通道）
+    1. RGB是3通道输入，DVS是2通道输入，都映射到64维特征
     2. 在主干网每一层都施加区域关注约束来引导对齐
     3. 使用相同的目标函数进行各层级对齐
     """
     
     def __init__(self, 
                  cls_num=10, 
-                 img_shape=48,
+                 img_shape=32,
                  enable_hierarchical_focus=True,
                  focus_similarity_type='cosine',
                  focus_weight_constraint='softmax',
@@ -456,9 +456,9 @@ class EnhancedVGGSNNWithRegionalFocus(nn.Module):
         
         pool = SeqToANNContainer(nn.AvgPool2d(2))
         
-        # 统一输入层：RGB和DVS都是3通道到64通道
+        # 输入层：RGB是3通道，DVS是2通道，都映射到64通道
         self.rgb_input = Layer(3, 64, 3, 1, 1, True)
-        self.dvs_input = Layer(3, 64, 3, 1, 1, True)  # 改为3通道输入
+        self.dvs_input = Layer(2, 64, 3, 1, 1, True)  # DVS是2通道输入
         
         # 分层特征提取（便于插入区域关注）
         self.layer1 = Layer(64, 128, 3, 1, 1)
@@ -474,17 +474,9 @@ class EnhancedVGGSNNWithRegionalFocus(nn.Module):
         self.pool4 = pool
         
         W = int(img_shape / 2 / 2 / 2 / 2)
-        # 动态计算瓶颈层输入维度，避免硬编码导致的维度不匹配
-        # 实际输入可能因为DVS转换等因素导致尺寸变化
-        expected_bottleneck_input = 512 * W * W
-        
-        # 添加自适应层来处理维度不匹配
-        self.adaptive_pool = SeqToANNContainer(nn.AdaptiveAvgPool2d((W, W)))
-        
-        # 使用延迟初始化的瓶颈层，在第一次前向传播时确定实际维度
-        self.bottleneck = None
-        self.expected_bottleneck_input = expected_bottleneck_input
-        self.W = W
+        # 与baseline模型保持完全一致，使用动态计算的维度
+        # 不使用自适应池化层，直接使用计算出的W维度
+        self.bottleneck = SeqToANNContainer(nn.Linear(512 * W * W, 256))
         self.bottleneck_lif_node = LIFSpike()
         self.classifier = SeqToANNContainer(nn.Linear(256, cls_num))
         
@@ -511,38 +503,12 @@ class EnhancedVGGSNNWithRegionalFocus(nn.Module):
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
     
-    def convert_dvs_to_3channel(self, dvs_data):
-        """
-        将DVS的2通道数据转换为3通道
-        两通道各取0.5，堆叠到第三通道
-        
-        Args:
-            dvs_data: (N, T, 2, H, W) DVS数据
-        
-        Returns:
-            converted_data: (N, T, 3, H, W) 转换后的数据
-        """
-        N, T, C, H, W = dvs_data.shape
-        assert C == 2, f"DVS数据应该是2通道，但得到{C}通道"
-        
-        # 取两通道各0.5
-        channel_0 = dvs_data[:, :, 0:1] * 0.5  # (N, T, 1, H, W)
-        channel_1 = dvs_data[:, :, 1:2] * 0.5  # (N, T, 1, H, W)
-        
-        # 堆叠成第三通道
-        channel_2 = channel_0 + channel_1      # (N, T, 1, H, W)
-        
-        # 拼接成3通道
-        converted_data = torch.cat([channel_0, channel_1, channel_2], dim=2)  # (N, T, 3, H, W)
-        
-        return converted_data
-    
     def extract_hierarchical_features(self, x, domain_type='rgb'):
         """
         提取分层特征用于区域关注
         
         Args:
-            x: 输入数据 (N, T, C, H, W)
+            x: 输入数据 (N, T, C, H, W) - RGB是3通道，DVS是2通道
             domain_type: 'rgb' 或 'dvs'
         
         Returns:
@@ -552,13 +518,10 @@ class EnhancedVGGSNNWithRegionalFocus(nn.Module):
         """
         features = []
         
-        # 输入编码
+        # 输入编码 - RGB是3通道，DVS是2通道
         if domain_type == 'rgb':
             x, _ = self.rgb_input(x)
         else:
-            # DVS数据需要先转换为3通道
-            if x.shape[2] == 2:
-                x = self.convert_dvs_to_3channel(x)
             x, _ = self.dvs_input(x)
         features.append(x)  # 64维特征
         
@@ -582,27 +545,13 @@ class EnhancedVGGSNNWithRegionalFocus(nn.Module):
         x = self.pool4(x)
         features.append(x)  # 512维特征
         
-        # 瓶颈层 - 使用自适应池化确保维度匹配
+        # 瓶颈层 - 与baseline模型保持一致，直接flatten
         x_before_flatten = x  # 保存flatten前的特征用于区域关注
         
-        # 添加自适应池化以确保维度匹配
-        x = self.adaptive_pool(x)
-        
+        # 直接flatten，不使用自适应池化
         x = torch.flatten(x, 2)
         
-        # 动态初始化瓶颈层（如果还未初始化）
-        if self.bottleneck is None:
-            actual_input_dim = x.shape[-1]
-            
-            # 导入必要的层（在运行时导入以避免循环导入）
-            from TET__layer import SeqToANNContainer
-            
-            # 使用实际维度创建瓶颈层
-            self.bottleneck = SeqToANNContainer(nn.Linear(actual_input_dim, 256))
-            
-            # 将瓶颈层移动到正确的设备
-            self.bottleneck = self.bottleneck.to(x.device)
-        
+        # 使用动态维度的瓶颈层
         x = self.bottleneck(x)
         x, x_mem = self.bottleneck_lif_node(x, return_mem=True)
         # 注意：不将flatten后的特征添加到features中，因为它不是4D张量
@@ -679,20 +628,16 @@ class EnhancedVGGSNNWithRegionalFocus(nn.Module):
             # 原有的编码器损失（在输入层）
             if encoder_tl_loss_type == 'TCKA':
                 from loss_function import temporal_linear_CKA
-                # 使用输入层的记忆状态
+                # 使用输入层的记忆状态 - RGB是3通道，DVS是2通道
                 if source.shape[2] == 3:
                     _, source_encoded_mem = self.rgb_input(source)
                 else:
-                    # DVS转换为3通道后处理
-                    source_converted = self.convert_dvs_to_3channel(source) if source.shape[2] == 2 else source
-                    _, source_encoded_mem = self.dvs_input(source_converted)
+                    _, source_encoded_mem = self.dvs_input(source)
                 
                 if target.shape[2] == 3:
                     _, target_encoded_mem = self.rgb_input(target)
                 else:
-                    # DVS转换为3通道后处理
-                    target_converted = self.convert_dvs_to_3channel(target) if target.shape[2] == 2 else target
-                    _, target_encoded_mem = self.dvs_input(target_converted)
+                    _, target_encoded_mem = self.dvs_input(target)
                 
                 encoder_tl_loss = 1 - temporal_linear_CKA(
                     source_encoded_mem.view((batch_size, T, -1)),
@@ -737,9 +682,9 @@ class EnhancedVGGSNNWithRegionalFocus(nn.Module):
             return source_clf, target_clf, encoder_tl_loss, total_feature_loss
         
         else:
-            # 测试阶段：也需要处理DVS的3通道转换
+            # 测试阶段：直接处理DVS 2通道或RGB 3通道
             target_features, target_final, _ = self.extract_hierarchical_features(
-                target, 'dvs' if target.shape[2] == 2 else ('rgb' if target.shape[2] == 3 else 'dvs')
+                target, 'dvs' if target.shape[2] == 2 else 'rgb'
             )
             target_clf = self.classifier(target_final)
             return target_clf

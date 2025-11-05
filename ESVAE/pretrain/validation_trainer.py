@@ -16,7 +16,7 @@ class AlignmentTLTrainer_RGB2DVS_WithValidation(AlignmentTLTrainer_RGB2DVS):
     
     def train_with_validation(self, train_loader, val_loader):
         """
-        带验证集的训练方法
+        带验证集的训练方法（已移除早停机制，与tl.py保持一致）
         
         Args:
             train_loader: 训练数据加载器
@@ -27,8 +27,6 @@ class AlignmentTLTrainer_RGB2DVS_WithValidation(AlignmentTLTrainer_RGB2DVS):
             best_train_loss: 最佳训练损失
         """
         best_val_acc = 0.0
-        patience = 10  # 早停耐心值
-        patience_counter = 0
         
         for epoch in range(self.args.epochs):
             # 训练阶段
@@ -46,21 +44,13 @@ class AlignmentTLTrainer_RGB2DVS_WithValidation(AlignmentTLTrainer_RGB2DVS):
             self.writer.add_scalar('val/accuracy', val_acc, epoch)
             self.writer.add_scalar('val/loss', val_loss, epoch)
             
-            # 保存最佳模型
+            # 保存最佳模型（移除早停机制）
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 self.best_train_acc = train_acc
                 self.best_total_loss = train_loss
                 self.save_model_best(epoch)
-                patience_counter = 0
                 print(f"✓ 新的最佳验证准确率: {best_val_acc:.4f}")
-            else:
-                patience_counter += 1
-            
-            # 早停检查
-            if patience_counter >= patience:
-                print(f"验证准确率连续{patience}个epoch未提升，提前停止训练")
-                break
             
             print(f'Epoch [{epoch+1}/{self.args.epochs}] '
                   f'Train Acc: {train_acc:.4f}, Train Loss: {train_loss:.4f} | '

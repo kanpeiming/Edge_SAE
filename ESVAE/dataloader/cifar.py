@@ -43,7 +43,7 @@ def _accumulate(iterable, fn=lambda x, y: x + y):
         yield total
 
 
-def get_tl_cifar10(batch_size, train_set_ratio=1.0, dvs_train_set_ratio=1.0, val_ratio=0.1, use_cutout=False, cutout_length=16):
+def get_tl_cifar10(batch_size, train_set_ratio=1.0, dvs_train_set_ratio=1.0, val_ratio=0.0, use_cutout=False, cutout_length=16):
     """
     获取RGB到DVS迁移学习的CIFAR10数据加载器
     
@@ -51,14 +51,14 @@ def get_tl_cifar10(batch_size, train_set_ratio=1.0, dvs_train_set_ratio=1.0, val
         batch_size: 批次大小
         train_set_ratio: RGB训练集使用比例
         dvs_train_set_ratio: DVS训练集使用比例
-        val_ratio: 验证集比例（从DVS训练集中划分）
+        val_ratio: 验证集比例（从DVS训练集中划分），默认0.0与tl.py保持一致
     
     Returns:
         train_dataloader: 训练数据加载器（RGB+DVS配对数据，用于迁移学习）
         val_dataloader: 验证数据加载器（仅DVS数据，用于验证DVS分类性能）
         test_dataloader: 测试数据加载器（仅DVS数据）
     """
-    # 构建RGB训练变换序列 - 回退到32×32避免瓶颈层维度问题
+    # 构建RGB训练变换序列 - 保持32×32
     rgb_transforms = [
         transforms.Resize(32),
         transforms.RandomCrop(32, padding=4),
@@ -73,17 +73,16 @@ def get_tl_cifar10(batch_size, train_set_ratio=1.0, dvs_train_set_ratio=1.0, val
         rgb_transforms.append(Cutout(n_holes=1, length=cutout_length))
         
     rgb_trans_train = transforms.Compose(rgb_transforms)
-    # rgb_trans_test = transforms.Compose([transforms.Resize(48),
-    #                                  transforms.ToTensor(),
-    #                                  transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))])
     dvs_trans = transforms.Compose([transforms.Resize((32, 32)),
-                                    # transforms.RandomCrop(32, padding=4),
-                                    # transforms.RandomHorizontalFlip(),  # 随机水平翻转
                                     transforms.ToTensor(),
                                    ])
 
+    # 计算实际用于配对训练的DVS比例（需要排除验证集部分）
+    # 修复：与tl.py保持一致，默认val_ratio=0.0时使用全部DVS训练数据
+    actual_dvs_train_ratio = dvs_train_set_ratio * (1 - val_ratio)
+    
     # 创建迁移学习训练数据（RGB+DVS配对）
-    tl_train_data = TLCIFAR10(DIR['CIFAR10'], DIR['CIFAR10DVS'], train=True, dvs_train_set_ratio=dvs_train_set_ratio,
+    tl_train_data = TLCIFAR10(DIR['CIFAR10'], DIR['CIFAR10DVS'], train=True, dvs_train_set_ratio=actual_dvs_train_ratio,
                               transform=rgb_trans_train, dvs_transform=dvs_trans, download=True)
     
     # 按train_set_ratio划分RGB训练集
@@ -95,37 +94,51 @@ def get_tl_cifar10(batch_size, train_set_ratio=1.0, dvs_train_set_ratio=1.0, val
                                         generator=torch.Generator().manual_seed(1000))
 
     # 创建纯DVS数据集用于验证和测试
-    # DVS验证集：从DVS训练数据中划分
-    dvs_train_full = DVSCifar10v1(os.path.join(DIR['CIFAR10DVS'], 'train'), train=True, transform=True)
     dvs_test_data = DVSCifar10v1(os.path.join(DIR['CIFAR10DVS'], 'test'), train=False, transform=False)
     
-    # 按dvs_train_set_ratio划分DVS训练集
-    if dvs_train_set_ratio < 1.0:
-        n_dvs_train = len(dvs_train_full)
-        dvs_split = int(n_dvs_train * dvs_train_set_ratio)
-        dvs_train_full = my_random_split(dvs_train_full, [dvs_split, n_dvs_train - dvs_split],
-                                        generator=torch.Generator().manual_seed(1000))
-    
-    # 从DVS训练集中划分验证集
-    n_dvs_train_final = len(dvs_train_full)
-    n_dvs_val = int(n_dvs_train_final * val_ratio)
-    n_dvs_train_actual = n_dvs_train_final - n_dvs_val
-    
-    print(f"DVS数据划分: 总数={n_dvs_train_final}, 训练={n_dvs_train_actual}, 验证={n_dvs_val}")
-    
-    dvs_train_data, dvs_val_data = my_random_split(
-        dvs_train_full,
-        [n_dvs_train_actual, n_dvs_val],
-        generator=torch.Generator().manual_seed(1000)
-    )
+    # 只在需要验证集时才划分DVS训练数据
+    if val_ratio > 0.0:
+        dvs_train_full = DVSCifar10v1(os.path.join(DIR['CIFAR10DVS'], 'train'), train=True, transform=True)
+        
+        # 按dvs_train_set_ratio划分DVS训练集
+        if dvs_train_set_ratio < 1.0:
+            n_dvs_train = len(dvs_train_full)
+            dvs_split = int(n_dvs_train * dvs_train_set_ratio)
+            dvs_train_full = my_random_split(dvs_train_full, [dvs_split, n_dvs_train - dvs_split],
+                                            generator=torch.Generator().manual_seed(1000))
+        
+        # 从DVS训练集中划分验证集
+        n_dvs_train_final = len(dvs_train_full)
+        n_dvs_val = int(n_dvs_train_final * val_ratio)
+        n_dvs_train_actual = n_dvs_train_final - n_dvs_val
+        
+        print(f"DVS数据划分详情:")
+        print(f"  原始DVS训练集总数: {n_dvs_train_final}")
+        print(f"  验证集比例: {val_ratio}")
+        print(f"  用于RGB-DVS配对训练: {n_dvs_train_actual} (避免数据泄露)")
+        print(f"  DVS验证集: {n_dvs_val} (独立验证)")
+        print(f"  实际配对训练比例: {actual_dvs_train_ratio:.3f}")
+        
+        dvs_train_data, dvs_val_data = my_random_split(
+            dvs_train_full,
+            [n_dvs_train_actual, n_dvs_val],
+            generator=torch.Generator().manual_seed(1000)
+        )
+        
+        # 验证：纯DVS数据，用于验证DVS分类性能
+        val_dataloader = DataLoaderX(dvs_val_data, batch_size=batch_size, shuffle=False, num_workers=8, drop_last=False,
+                                     pin_memory=True)
+    else:
+        # 与tl.py保持一致：不使用验证集时，返回None
+        val_dataloader = None
+        print(f"DVS数据划分详情 (与tl.py一致):")
+        print(f"  不划分验证集，使用全部DVS训练数据")
+        print(f"  用于RGB-DVS配对训练: {len(tl_train_data.dvs_data) if hasattr(tl_train_data, 'dvs_data') else 'N/A'}")
 
     # 创建数据加载器
     # 训练：RGB+DVS配对数据，用于迁移学习
     train_dataloader = DataLoaderX(tl_train_data, batch_size=batch_size, shuffle=True, num_workers=8, drop_last=True,
                                    pin_memory=True)
-    # 验证：纯DVS数据，用于验证DVS分类性能
-    val_dataloader = DataLoaderX(dvs_val_data, batch_size=batch_size, shuffle=False, num_workers=8, drop_last=False,
-                                 pin_memory=True)
     # 测试：纯DVS数据
     test_dataloader = DataLoaderX(dvs_test_data, batch_size=batch_size, shuffle=False, num_workers=8, drop_last=False,
                                   pin_memory=True)
@@ -141,7 +154,7 @@ def get_cifar10(batch_size, train_set_ratio=1.0):
     trans_train = transforms.Compose([transforms.Resize(32),
                                       transforms.RandomCrop(32, padding=4),
                                       transforms.RandomHorizontalFlip(),  # 随机水平翻转
-                                      CIFAR10Policy(),  # TODO: 待注释
+                                      # CIFAR10Policy(),  # AutoAugment策略 - 已注释以避免影响实验效果
                                       transforms.ToTensor(),
                                       # transforms.RandomGrayscale(),  # 随机变为灰度图
                                       transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),  # 归一化
@@ -307,7 +320,7 @@ class DVSCifar10v1(Dataset):
         self.transform = transform
         self.target_transform = target_transform
         self.train = train
-        self.resize = transforms.Resize(size=(48, 48))
+        self.resize = transforms.Resize(size=(32, 32))
         self.tensorx = transforms.ToTensor()
         self.imgx = transforms.ToPILImage()
 

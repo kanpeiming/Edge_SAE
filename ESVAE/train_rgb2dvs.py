@@ -42,14 +42,14 @@ parser.add_argument('--optim', default='Adam', type=str, choices=['SGD', 'Adam']
 parser.add_argument('--lr', default=0.001, type=float,
                     help='Learning rate')  # CIFAR10: 0.0002, Caltech101: 0.0002, MNIST: 0.0001
 parser.add_argument('--weight_decay', default=5e-4, type=float, help='Weight decay')
-parser.add_argument('--epochs', default=80, type=int, help='Training epochs')
+parser.add_argument('--epochs', default=100, type=int, help='Training epochs')
 parser.add_argument('--device', default='cuda', type=str, help='cuda or cpu')
 parser.add_argument('--parallel', default=False, type=bool, help='Whether to use multi-GPU parallelism')
 parser.add_argument('--T', default=10, type=int, help='snn simulation time (default: 10)')
 parser.add_argument('--encoder_type', type=str, default='time_encoder',
                     choices=['lap_encoder', 'poison_encoder', 'time_encoder'],
                     help='the encoder type of rgb data for snn.')
-parser.add_argument('--seed', type=int, default=1000, help='seed for initializing training. ')
+parser.add_argument('--seed', type=int, default=42, help='seed for initializing training. ')
 parser.add_argument('--encoder_tl_loss_type', type=str, default='CKA', choices=['TCKA', 'CKA'],
                     help='the transfer loss for transfer learning.')
 parser.add_argument('--feature_tl_loss_type', type=str, default='TCKA',
@@ -68,6 +68,9 @@ parser.add_argument('--regional_alpha', default=0.5, type=float,
                     help='Weight for multi-layer regional focus loss (default: 0.5)')
 parser.add_argument('--regional_beta', default=0.01, type=float,
                     help='Beta for regional focus regularization (deprecated, kept for compatibility)')
+# Model Architecture 参数
+parser.add_argument('--use_woap', default=False, type=bool,
+                    help='Whether to use without Average Pooling version (stride=2 conv instead of AvgPool2d)')
 parser.add_argument('--log_dir', type=str, default='/home/user/kpm/kpm/results/SDSTL/r2e/log_dir',
                     help='the path of tensorboard dir.')
 parser.add_argument('--checkpoint', type=str, default='/home/user/kpm/kpm/results/SDSTL/r2e/checkpoints',
@@ -76,8 +79,8 @@ parser.add_argument('--GPU_id', type=int, default=0, help='the id of used GPU.')
 parser.add_argument('--num_classes', type=int, default=10, help='the number of data classes.')
 parser.add_argument('--RGB_sample_ratio', type=float, default=1.0, help='the ratio of used RGB training set. ')
 parser.add_argument('--dvs_sample_ratio', type=float, default=1.0, help='the ratio of used dvs training set. ')
-parser.add_argument('--val_ratio', type=float, default=0.1, help='the ratio of validation set split from training set.')
-parser.add_argument('--use_validation', default=True, type=bool, help='Whether to use validation set during training')
+parser.add_argument('--val_ratio', type=float, default=0.1, help='the ratio of validation set split from training set. (default: 0.0, consistent with tl.py)')
+parser.add_argument('--use_validation', default=True, type=bool, help='Whether to use validation set during training (default: False, consistent with tl.py)')
 parser.add_argument('--use_cutout', default=False, type=bool, help='Whether to use Cutout data augmentation')
 parser.add_argument('--cutout_length', default=16, type=int, help='Length of cutout square')
 
@@ -89,6 +92,7 @@ device = torch.device(f"cuda:{args.GPU_id}")
 log_name = (
     f"RGB2DVS_{args.data_set}_"
     f"{'MLR-' + args.regional_similarity + f'-{args.regional_alpha}' if args.use_regional_focus else 'baseline'}_"
+    f"{'woAP' if args.use_woap else 'AP'}_"
     f"enc-{args.encoder_type}_"
     f"opt-{args.optim}_"
     f"lr{args.lr}_"
@@ -125,8 +129,8 @@ print(writer.log_dir)
 # 打印改进信息
 print("\n=== 训练改进策略 ===")
 print(f"✓ 图像分辨率: 32×32 (保持原始尺寸，避免瓶颈层维度问题)")
-print(f"✓ AutoAugment: CIFAR10Policy (25种子策略)")
-print(f"✓ 分层学习率: 输入层×10, 其他层×1")
+# print(f"✓ AutoAugment: CIFAR10Policy (25种子策略)")
+# print(f"✓ 分层学习率: 输入层×10, 其他层×1")
 if args.use_cutout:
     print(f"✓ Cutout增强: 启用 (长度={args.cutout_length})")
 else:
@@ -139,38 +143,37 @@ if __name__ == "__main__":
 
     # preparing data - 加载RGB和DVS数据
     if args.data_set == 'CIFAR10':
-        if args.use_validation:
-            train_loader, val_loader, dvs_test_loader = dataloader.cifar.get_tl_cifar10(
-                args.batch_size, 
-                args.RGB_sample_ratio, 
-                args.dvs_sample_ratio,
-                args.val_ratio,
-                args.use_cutout,
-                args.cutout_length
-            )
-            print("训练集RGB数量", train_loader.dataset.get_len()[0])
-            print("训练集DVS数量", train_loader.dataset.get_len()[1])
-            print("验证集DVS数量", len(val_loader.dataset))
-            print("测试集DVS数量", len(dvs_test_loader.dataset))
+        # 统一调用数据加载器
+        train_loader, val_loader, dvs_test_loader = dataloader.cifar.get_tl_cifar10(
+            args.batch_size,
+            args.RGB_sample_ratio,
+            args.dvs_sample_ratio,
+            args.val_ratio,
+            args.use_cutout,
+            args.cutout_length
+        )
+        
+        print("\n=== 数据集分配总结 ===")
+        print(f"RGB训练集数量: {train_loader.dataset.get_len()[0]}")
+        print(f"DVS配对训练数量: {train_loader.dataset.get_len()[1]} (用于RGB-DVS迁移学习)")
+        
+        if val_loader is not None and args.use_validation:
+            print(f"DVS验证集数量: {len(val_loader.dataset)} (独立验证，不参与配对)")
+            # 计算数据分配
+            dvs_total_for_training = len(val_loader.dataset) / args.val_ratio
+            dvs_actual_training = int(dvs_total_for_training * (1 - args.val_ratio))
+            print(f"✓ 正确分配: DVS总数{int(dvs_total_for_training)} = 配对训练{dvs_actual_training} + 验证{len(val_loader.dataset)}")
+            print(f"✓ 避免数据泄露: 验证集DVS数据不参与RGB-DVS配对训练")
         else:
-            # 兼容原有的无验证集模式
-            train_loader, _, dvs_test_loader = dataloader.cifar.get_tl_cifar10(
-                args.batch_size, 
-                args.RGB_sample_ratio, 
-                args.dvs_sample_ratio,
-                0.0,  # 不划分验证集
-                args.use_cutout,
-                args.cutout_length
-            )
-            val_loader = None
-            print("训练集RGB数量", train_loader.dataset.get_len()[0])
-            print("训练集DVS数量", train_loader.dataset.get_len()[1])
-            print("测试集DVS数量", len(dvs_test_loader.dataset))
+            print(f"DVS验证集: 无 (与tl.py一致，使用全部DVS训练数据)")
+        
+        print(f"DVS测试集数量: {len(dvs_test_loader.dataset)}")
+        print("=====================\n")
     elif args.data_set == 'MNIST':
         # MNIST暂时不支持验证集划分，使用原有方式
         train_loader, dvs_test_loader = get_tl_mnist(
-            args.batch_size, 
-            args.RGB_sample_ratio, 
+            args.batch_size,
+            args.RGB_sample_ratio,
             args.dvs_sample_ratio
         )
         val_loader = None
@@ -181,8 +184,8 @@ if __name__ == "__main__":
     elif args.data_set == 'Caltech101':
         # Caltech101暂时不支持验证集划分，使用原有方式
         train_loader, dvs_test_loader = get_tl_caltech101(
-            args.batch_size, 
-            args.RGB_sample_ratio, 
+            args.batch_size,
+            args.RGB_sample_ratio,
             args.dvs_sample_ratio
         )
         val_loader = None
@@ -193,60 +196,94 @@ if __name__ == "__main__":
     else:
         raise NotImplementedError(f"Dataset {args.data_set} not implemented for RGB2DVS transfer")
 
-    # preparing model - 选择模型
+    # preparing model - 选择模型（支持4种组合）
     if args.use_regional_focus:
         import sys
         import os
+
         # 添加Regional-Focus目录到路径
         regional_focus_path = os.path.join(os.path.dirname(__file__), 'Regional-Focus')
         if regional_focus_path not in sys.path:
             sys.path.insert(0, regional_focus_path)
-        from enhanced_model import VGGSNN_RegionalFocus
         
+        if args.use_woap:
+            from enhanced_model import VGGSNN_RegionalFocuswoAP
+            model_class = VGGSNN_RegionalFocuswoAP
+            img_shape = 48  # woAP版本默认使用48x48
+            model_name = "多层级区域关注模块 (without Average Pooling)"
+            architecture_details = "6层 (输入层→Conv2→Conv4→Conv6→Conv8→瓶颈层), stride=2替代池化"
+        else:
+            from enhanced_model import VGGSNN_RegionalFocus
+            model_class = VGGSNN_RegionalFocus
+            img_shape = 32  # AP版本使用32x32
+            model_name = "多层级区域关注模块 (with Average Pooling)"
+            architecture_details = "6层 (输入层→Pool1→Pool2→Pool3→Pool4→瓶颈层), AvgPool2d下采样"
+
         # 多层级区域关注配置
         regional_focus_config = {
             'similarity_type': args.regional_similarity,
             'weight_constraint': 'softmax',
             'alpha': args.regional_alpha,  # 区域关注损失权重
         }
-        
-        model = VGGSNN_RegionalFocus(
-            cls_num=args.num_classes, 
-            img_shape=32, 
+
+        model = model_class(
+            cls_num=args.num_classes,
+            img_shape=img_shape,
             device=device,
             use_regional_focus=True,
             regional_focus_config=regional_focus_config
         )
-        print(f"使用多层级区域关注模块:")
+        print(f"使用{model_name}:")
         print(f"  相似度类型: {args.regional_similarity}")
         print(f"  区域关注权重: {args.regional_alpha}")
-        print(f"  DVS输入: 2通道→3通道自动转换")
-        print(f"  约束层级: 6层 (输入层→Pool1→Pool2→Pool3→Pool4→瓶颈层)")
+        print(f"  输入通道: RGB=3通道, DVS=2通道")
+        print(f"  约束层级: {architecture_details}")
+        print(f"  图像尺寸: {img_shape}×{img_shape}")
     else:
-        model = VGGSNN(cls_num=args.num_classes, img_shape=32, device=device)
-        print("使用标准VGGSNN模型")
+        if args.use_woap:
+            from pretrain.pretrainModel import VGGSNNwoAP
+            model = VGGSNNwoAP(cls_num=args.num_classes, img_shape=32)  # 修复：传入正确参数，使用32x32
+            print("使用标准VGGSNNwoAP模型 (without Average Pooling)")
+            print("  架构: stride=2卷积替代AvgPool2d")
+            print("  图像尺寸: 32×32 (与tl.py保持一致)")
+            print("  瓶颈层: LIFSpike独立（与tl.py保持一致）")
+        else:
+            model = VGGSNN(cls_num=args.num_classes, img_shape=32, device=device)
+            print("使用标准VGGSNN模型 (with Average Pooling)")
+            print("  架构: AvgPool2d下采样")
+            print("  图像尺寸: 32×32")
 
     if args.parallel:
         model = torch.nn.DataParallel(model)
     model.to(device)
 
-    # preparing training set - 使用分层学习率策略
+    # preparing training set - 使用统一学习率策略
     if args.optim == 'Adam':
-        # Adam优化器使用分层学习率
+        # 使用统一学习率
+        # optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        # print(f"使用Adam优化器，统一学习率: {args.lr}")
+        
+        # 分层学习率（可选）
         optimizer = torch.optim.Adam([
             {'params': [p for n, p in model.named_parameters() if 'input' in n], 'lr': args.lr * 10},
             {'params': [p for n, p in model.named_parameters() if 'input' not in n], 'lr': args.lr}
         ])
         print(f"使用Adam优化器，输入层学习率: {args.lr * 10}, 其他层学习率: {args.lr}")
+
     elif args.optim == 'SGD':
-        # SGD优化器使用分层学习率
-        optimizer = torch.optim.SGD([
-            {'params': [p for n, p in model.named_parameters() if 'input' in n], 
-             'lr': args.lr * 10, 'momentum': 0.9, 'weight_decay': args.weight_decay, 'nesterov': False},
-            {'params': [p for n, p in model.named_parameters() if 'input' not in n], 
-             'lr': args.lr, 'momentum': 0.9, 'weight_decay': args.weight_decay, 'nesterov': False}
-        ])
-        print(f"使用SGD优化器，输入层学习率: {args.lr * 10}, 其他层学习率: {args.lr}")
+        # 使用统一学习率
+        optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9,
+                                    weight_decay=args.weight_decay, nesterov=False)
+        print(f"使用SGD优化器，统一学习率: {args.lr}")
+        
+        # 分层学习率（可选）
+        # optimizer = torch.optim.SGD([
+        #     {'params': [p for n, p in model.named_parameters() if 'input' in n],
+        #      'lr': args.lr * 10, 'momentum': 0.9, 'weight_decay': args.weight_decay, 'nesterov': False},
+        #     {'params': [p for n, p in model.named_parameters() if 'input' not in n],
+        #      'lr': args.lr, 'momentum': 0.9, 'weight_decay': args.weight_decay, 'nesterov': False}
+        # ])
+        # print(f"使用SGD优化器，输入层学习率: {args.lr * 10}, 其他层学习率: {args.lr}")
     else:
         raise Exception(f"The value of optim should in ['SGD', 'Adam'], "
                         f"and your input is {args.optim}")
@@ -276,7 +313,7 @@ if __name__ == "__main__":
             args, device, writer, model, optimizer, TET_loss, scheduler, model_path
         )
         best_train_acc, best_train_loss = trainer.train(train_loader)
-    
+
     test_loss, test_acc1, test_acc5 = trainer.test(dvs_test_loader)
 
     print(f'test_loss={test_loss:.5f} test_acc1={test_acc1:.3f} test_acc5={test_acc5:.4f}')
@@ -294,4 +331,3 @@ if __name__ == "__main__":
     )
     f.write(write_content)
     f.close()
-
