@@ -366,10 +366,18 @@ class AlignmentTLTrainer_Edge_1(TLTrainer):
     def __init__(self, args, device, writer, network, optimizer, criterion, scheduler, model_path):
         super().__init__(args, device, writer, network, optimizer, criterion, scheduler, model_path)
         self.best_total_loss = float('inf')
-        self.best_model_path = os.path.join(model_path, "best_model.pth")
+        # 如果model_path是文件路径，取其目录；如果是目录路径，直接使用
+        if model_path.endswith('.pth'):
+            model_dir = os.path.dirname(model_path)
+        else:
+            model_dir = model_path
+        self.best_model_path = os.path.join(model_dir, "best_model.pth")
 
     def save_model_best(self, epoch):
         """保存当前最佳模型"""
+        # 确保保存目录存在
+        os.makedirs(os.path.dirname(self.best_model_path), exist_ok=True)
+        
         torch.save({
             'epoch': epoch,
             'model_state_dict': self.network.state_dict(),
@@ -537,6 +545,55 @@ class AlignmentTLTrainer_Edge_1(TLTrainer):
 
         return self.best_train_acc, self.best_total_loss
 
+    def test(self, test_loader):
+        """
+        RGB2DVS迁移学习的测试方法
+        测试时只使用DVS数据进行推理
+        """
+        self.network.eval()
+        test_loss = 0
+        test_num = 0
+        test_correct = 0
+        test_correct5 = 0
+
+        with torch.no_grad():
+            for i, (data, labels) in enumerate(test_loader):
+                # 测试数据是纯DVS数据，不需要RGB编码
+                dvs_data = data
+                labels = labels.to(self.device)
+                
+                # DVS数据维度处理
+                if len(dvs_data.shape) == 4:  # (N, 2, H, W)
+                    # 需要添加时间维度: (N, 2, H, W) -> (N, T, 2, H, W)
+                    dvs_data = dvs_data.unsqueeze(1).repeat(1, self.args.T, 1, 1, 1)
+                
+                dvs_data = dvs_data.to(self.device)
+                
+                # 在测试模式下，网络只需要DVS数据
+                # 由于网络设计需要两个输入，我们传入相同的DVS数据
+                # 但网络内部会识别这是测试模式并只使用target分支
+                outputs = self.network(dvs_data.float(), dvs_data.float())
+                
+                # 如果网络返回多个输出（训练模式），取target输出
+                if isinstance(outputs, tuple):
+                    # 训练模式返回: (source_outputs, target_outputs, encoder_tl_loss, feature_tl_loss)
+                    _, target_outputs, _, _ = outputs
+                    outputs = target_outputs
+                
+                mean_out = outputs.mean(1)
+                loss = self.criterion(outputs, labels)
+                
+                test_loss += loss.item()
+                test_num += float(labels.size(0))
+                
+                test_acc1, test_acc5 = accuracy(mean_out, labels, topk=(1, 5))
+                test_correct += test_acc1.item()
+                test_correct5 += test_acc5.item()
+                
+                reset_net(self.network)
+        
+        return test_loss / test_num, test_correct / test_num, test_correct5 / test_num
+
 
 class AlignmentTLTrainer_RGB2DVS(TLTrainer):
     """
@@ -593,11 +650,16 @@ class AlignmentTLTrainer_RGB2DVS(TLTrainer):
                 if source_data.shape[1] == 3:
                     source_data = self.encoder_dict[self.args.encoder_type](source_data)
                 
-                # DVS数据已经是(N, T, 2, H, W)格式，无需编码
-                # 但如果是其他格式需要处理
-                if len(target_data.shape) == 4:  # (N, 2, H, W)
+                # DVS数据处理：从(N, T, 2, H, W)格式无需额外编码
+                # 检查DVS数据维度是否正确
+                if len(target_data.shape) == 4:  # (N, 2, H, W) - 缺少时间维度
                     # 需要添加时间维度
                     target_data = target_data.unsqueeze(1).repeat(1, self.args.T, 1, 1, 1)
+                elif len(target_data.shape) == 5:  # (N, T, 2, H, W) - 正确格式
+                    # DVS数据已经包含时间维度，无需处理
+                    pass
+                else:
+                    raise ValueError(f"Unexpected DVS data shape: {target_data.shape}")
 
                 # 数据转移到设备
                 source_data, labels = source_data.to(self.device), labels.to(self.device)
@@ -724,3 +786,52 @@ class AlignmentTLTrainer_RGB2DVS(TLTrainer):
             print("------------------------------------------------------")
 
         return self.best_train_acc, self.best_total_loss
+
+    def test(self, test_loader):
+        """
+        RGB2DVS迁移学习的测试方法
+        测试时只使用DVS数据进行推理
+        """
+        self.network.eval()
+        test_loss = 0
+        test_num = 0
+        test_correct = 0
+        test_correct5 = 0
+
+        with torch.no_grad():
+            for i, (data, labels) in enumerate(test_loader):
+                # 测试数据是纯DVS数据，不需要RGB编码
+                dvs_data = data
+                labels = labels.to(self.device)
+                
+                # DVS数据维度处理
+                if len(dvs_data.shape) == 4:  # (N, 2, H, W)
+                    # 需要添加时间维度: (N, 2, H, W) -> (N, T, 2, H, W)
+                    dvs_data = dvs_data.unsqueeze(1).repeat(1, self.args.T, 1, 1, 1)
+                
+                dvs_data = dvs_data.to(self.device)
+                
+                # 在测试模式下，网络只需要DVS数据
+                # 由于网络设计需要两个输入，我们传入相同的DVS数据
+                # 但网络内部会识别这是测试模式并只使用target分支
+                outputs = self.network(dvs_data.float(), dvs_data.float())
+                
+                # 如果网络返回多个输出（训练模式），取target输出
+                if isinstance(outputs, tuple):
+                    # 训练模式返回: (source_outputs, target_outputs, encoder_tl_loss, feature_tl_loss)
+                    _, target_outputs, _, _ = outputs
+                    outputs = target_outputs
+                
+                mean_out = outputs.mean(1)
+                loss = self.criterion(outputs, labels)
+                
+                test_loss += loss.item()
+                test_num += float(labels.size(0))
+                
+                test_acc1, test_acc5 = accuracy(mean_out, labels, topk=(1, 5))
+                test_correct += test_acc1.item()
+                test_correct5 += test_acc5.item()
+                
+                reset_net(self.network)
+        
+        return test_loss / test_num, test_correct / test_num, test_correct5 / test_num

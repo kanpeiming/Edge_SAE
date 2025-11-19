@@ -6,7 +6,7 @@
 @time: 2022/4/19 11:11
 """
 '''
-RGB到RGB结构的迁移训练
+RGB到RGB结构的迁移训练--cifar10
 '''
 
 import argparse

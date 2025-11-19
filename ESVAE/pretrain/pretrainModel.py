@@ -6,7 +6,7 @@
 @time: 2022/4/19 20:54
 The code in this file is form Temporal Efficient Training of Spiking Neural Network via Gradient Re-weighting https://github.com/Gus-Lab/temporal_efficient_training
 """
-from cv2.dnn import Layer
+# 移除错误的cv2.dnn.Layer导入，使用正确的SNN Layer
 import models.TET__layer
 from tl_utils.loss_function import *
 from pretrain.Edge import *
@@ -23,16 +23,16 @@ class VGGSNN(nn.Module):
         self.dvs_input = Layer(2, 64, 3, 1, 1, True)  # DVS 2通道输入
 
         self.features = nn.Sequential(
-            Layer(64, 128, 3, 1, 1),
+            Layer(64, 128, 3, 1, 1, False),
             pool,
-            Layer(128, 256, 3, 1, 1),
-            Layer(256, 256, 3, 1, 1),
+            Layer(128, 256, 3, 1, 1, False),
+            Layer(256, 256, 3, 1, 1, False),
             pool,
-            Layer(256, 512, 3, 1, 1),
-            Layer(512, 512, 3, 1, 1),
+            Layer(256, 512, 3, 1, 1, False),
+            Layer(512, 512, 3, 1, 1, False),
             pool,
-            Layer(512, 512, 3, 1, 1),
-            Layer(512, 512, 3, 1, 1),
+            Layer(512, 512, 3, 1, 1, False),
+            Layer(512, 512, 3, 1, 1, False),
             pool,
         )
         W = int(img_shape / 2 / 2 / 2 / 2)
@@ -137,13 +137,13 @@ class VGGSNNwoAP(VGGSNN):
         self.rgb_input = Layer(3, 64, 3, 1, 1, True)  # 保持True以记录mem
         self.dvs_input = Layer(2, 64, 3, 1, 1, True)  # 保持True以记录mem
         self.features = nn.Sequential(
-            Layer(64, 128, 3, 2, 1),
-            Layer(128, 256, 3, 1, 1),
-            Layer(256, 256, 3, 2, 1),
-            Layer(256, 512, 3, 1, 1),
-            Layer(512, 512, 3, 2, 1),
-            Layer(512, 512, 3, 1, 1),
-            Layer(512, 512, 3, 2, 1),
+            Layer(64, 128, 3, 2, 1, False),
+            Layer(128, 256, 3, 1, 1, False),
+            Layer(256, 256, 3, 2, 1, False),
+            Layer(256, 512, 3, 1, 1, False),
+            Layer(512, 512, 3, 2, 1, False),
+            Layer(512, 512, 3, 1, 1, False),
+            Layer(512, 512, 3, 2, 1, False),
         )
         W = int(img_shape / 2 / 2 / 2 / 2)
         # 修复：与tl.py保持一致，LIFSpike作为独立层

@@ -299,6 +299,31 @@ class CIFAR10Policy(object):
         return "AutoAugment CIFAR10 Policy"
 
 
+class RGBToGrayscale3Channel(object):
+    """将RGB图像转换为灰度图，但保持三通道格式
+    
+    这个变换将RGB图像转换为灰度图像，但保持三个通道，每个通道都包含相同的灰度值。
+    这样可以测试RGB到DVS的迁移学习是否基于结构信息而非色彩信息。
+    """
+    
+    def __call__(self, img):
+        """
+        Args:
+            img (PIL Image): RGB图像
+            
+        Returns:
+            PIL Image: 灰度图像但保持三通道格式
+        """
+        # 转换为灰度图
+        grayscale = img.convert('L')
+        # 转换回RGB格式（三个通道都是相同的灰度值）
+        rgb_grayscale = Image.merge('RGB', (grayscale, grayscale, grayscale))
+        return rgb_grayscale
+    
+    def __repr__(self):
+        return self.__class__.__name__ + '()'
+
+
 class DVSResize(object):
     """Resize the input PIL Image to the given size.
 

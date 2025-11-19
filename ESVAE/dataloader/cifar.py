@@ -43,7 +43,7 @@ def _accumulate(iterable, fn=lambda x, y: x + y):
         yield total
 
 
-def get_tl_cifar10(batch_size, train_set_ratio=1.0, dvs_train_set_ratio=1.0, val_ratio=0.0, use_cutout=False, cutout_length=16):
+def get_tl_cifar10(batch_size, train_set_ratio=1.0, dvs_train_set_ratio=1.0, val_ratio=0.0, use_cutout=False, cutout_length=16, use_grayscale=False):
     """
     获取RGB到DVS迁移学习的CIFAR10数据加载器
     
@@ -52,6 +52,9 @@ def get_tl_cifar10(batch_size, train_set_ratio=1.0, dvs_train_set_ratio=1.0, val
         train_set_ratio: RGB训练集使用比例
         dvs_train_set_ratio: DVS训练集使用比例
         val_ratio: 验证集比例（从DVS训练集中划分），默认0.0与tl.py保持一致
+        use_cutout: 是否使用Cutout数据增强
+        cutout_length: Cutout的长度
+        use_grayscale: 是否将RGB转换为灰度图（保持三通道）
     
     Returns:
         train_dataloader: 训练数据加载器（RGB+DVS配对数据，用于迁移学习）
@@ -63,23 +66,38 @@ def get_tl_cifar10(batch_size, train_set_ratio=1.0, dvs_train_set_ratio=1.0, val
         transforms.Resize(32),
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),  # 随机水平翻转
-        CIFAR10Policy(),  # AutoAugment策略
+    ]
+    
+    # 可选添加灰度转换（在数据增强之前）
+    if use_grayscale:
+        rgb_transforms.append(RGBToGrayscale3Channel())
+    
+    rgb_transforms.extend([
+        # CIFAR10Policy(),  # AutoAugment策略
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),  # 归一化
-    ]
+    ])
     
     # 可选添加Cutout数据增强
     if use_cutout:
         rgb_transforms.append(Cutout(n_holes=1, length=cutout_length))
         
     rgb_trans_train = transforms.Compose(rgb_transforms)
-    dvs_trans = transforms.Compose([transforms.Resize((32, 32)),
-                                    transforms.ToTensor(),
-                                   ])
+    # DVS数据transform - 添加归一化以与RGB数据保持一致
+    dvs_trans = transforms.Compose([
+        transforms.Resize((32, 32)),
+        transforms.ToTensor(),
+        # DVS数据通常是二值的，使用简单的归一化
+        # transforms.Normalize((0.5, 0.5), (0.5, 0.5)),  # 将[0,1]映射到[-1,1]
+    ])
 
-    # 计算实际用于配对训练的DVS比例（需要排除验证集部分）
-    # 修复：与tl.py保持一致，默认val_ratio=0.0时使用全部DVS训练数据
-    actual_dvs_train_ratio = dvs_train_set_ratio * (1 - val_ratio)
+    # 计算实际用于配对训练的DVS比例
+    # 修复：只有在实际使用验证集时才减少DVS训练数据
+    if val_ratio > 0.0:
+        actual_dvs_train_ratio = dvs_train_set_ratio * (1 - val_ratio)
+    else:
+        # 与tl.py保持一致：不使用验证集时，使用全部DVS训练数据
+        actual_dvs_train_ratio = dvs_train_set_ratio
     
     # 创建迁移学习训练数据（RGB+DVS配对）
     tl_train_data = TLCIFAR10(DIR['CIFAR10'], DIR['CIFAR10DVS'], train=True, dvs_train_set_ratio=actual_dvs_train_ratio,
@@ -133,7 +151,7 @@ def get_tl_cifar10(batch_size, train_set_ratio=1.0, dvs_train_set_ratio=1.0, val
         val_dataloader = None
         print(f"DVS数据划分详情 (与tl.py一致):")
         print(f"  不划分验证集，使用全部DVS训练数据")
-        print(f"  用于RGB-DVS配对训练: {len(tl_train_data.dvs_data) if hasattr(tl_train_data, 'dvs_data') else 'N/A'}")
+        print(f"  用于RGB-DVS配对训练: {len(tl_train_data.dvs_data)} (实际使用比例: {actual_dvs_train_ratio:.3f})")
 
     # 创建数据加载器
     # 训练：RGB+DVS配对数据，用于迁移学习

@@ -10,6 +10,7 @@ import gc
 import time
 import torch
 import itertools
+from tqdm import tqdm
 from tl_utils.common_utils import LapPoissonEncoder, MyPoissonEncoder, TimeEncoder, accuracy
 
 try:
@@ -60,7 +61,12 @@ class Trainer(object):
             train_num = 0
             train_correct = 0
 
-            for i, (data, labels) in enumerate(train_loader):
+            # 添加tqdm进度条
+            pbar = tqdm(enumerate(train_loader), total=len(train_loader), 
+                       desc=f'Epoch [{epoch+1}/{self.args.epoch}]', 
+                       leave=True)
+            
+            for i, (data, labels) in pbar:
                 self.optimizer.zero_grad()
 
                 # 若输入为rgb图片，则转换为2通道的脉冲编码，(N, 3, H, W) -> (N, T, 2, H, W)
@@ -81,6 +87,14 @@ class Trainer(object):
                 train_num += float(labels.size(0))
                 _, predicted = mean_out.cpu().max(1)
                 train_correct += float(predicted.eq(labels.cpu()).sum().item())
+                
+                # 更新进度条信息
+                current_loss = train_loss / (i + 1)
+                current_acc = train_correct / train_num
+                pbar.set_postfix({'loss': f'{current_loss:.4f}', 'acc': f'{current_acc:.3f}'})
+            
+            pbar.close()
+            
             self.scheduler.step()
             train_acc = train_correct / train_num
             train_loss = train_loss / train_num
@@ -1496,4 +1510,265 @@ class AlignmentTLTrainer_Edge_1(TLTrainer):
             print(u'free：%.4f GB' % (info.free / 1024 / 1024 / 1024))
             print(u'当前使用的总内存占比：', info.percent)
             print("------------------------------------------------------")
+        return self.best_train_acc, self.best_val_acc
+
+
+class AlignmentTLTrainerWithProgressBar(AlignmentTLTrainer):
+    """
+    带进度条的AlignmentTLTrainer，支持灰度转换
+    
+    主要特性:
+    - 添加tqdm进度条显示训练进度
+    - 支持--use_grayscale参数进行RGB到灰度的转换
+    - 实时显示Loss、RGB_Acc、DVS_Acc等指标
+    - 保持与标准AlignmentTLTrainer完全兼容
+    """
+    
+    def __init__(self, args, device, writer, network, optimizer, criterion, scheduler, model_path):
+        super(AlignmentTLTrainerWithProgressBar, self).__init__(args, device, writer, network, optimizer, criterion, scheduler, model_path)
+        
+        # 导入PIL用于灰度转换
+        try:
+            from PIL import Image
+            self.Image = Image
+        except ImportError:
+            self.Image = None
+            print("Warning: PIL not available, grayscale conversion will be disabled")
+    
+    def rgb_to_grayscale_3channel(self, rgb_tensor):
+        """
+        将RGB tensor转换为灰度但保持三通道格式
+        
+        Args:
+            rgb_tensor: (N, 3, H, W) 的RGB tensor
+            
+        Returns:
+            grayscale_tensor: (N, 3, H, W) 的灰度tensor，三个通道值相同
+        """
+        if rgb_tensor.shape[1] != 3:
+            return rgb_tensor
+            
+        # 使用标准的RGB到灰度转换权重: 0.299*R + 0.587*G + 0.114*B
+        grayscale = 0.299 * rgb_tensor[:, 0:1, :, :] + \
+                   0.587 * rgb_tensor[:, 1:2, :, :] + \
+                   0.114 * rgb_tensor[:, 2:3, :, :]
+        
+        # 复制到三个通道
+        grayscale_3channel = torch.cat([grayscale, grayscale, grayscale], dim=1)
+        
+        return grayscale_3channel
+
+    def train(self, train_loader, dvs_val_loader):
+        for epoch in range(self.args.epoch):
+            self.network.train()
+            start = time.time()
+            train_num = 1
+            total_loss = 0
+            source_train_loss = 0
+            source_train_correct = 0
+            source_train_correct5 = 0
+            target_train_loss = 0
+            target_train_correct = 0
+            target_train_correct5 = 0
+            total_encoder_tl_loss = 0
+            total_feature_tl_loss = 0
+
+            # 添加进度条
+            pbar = tqdm(enumerate(train_loader), total=len(train_loader), 
+                       desc=f'Epoch [{epoch+1}/{self.args.epoch}]', 
+                       leave=True)
+            
+            for i, ((source_data, target_data), labels) in pbar:
+                self.optimizer.zero_grad()
+
+                # 应用灰度转换（如果启用）
+                if hasattr(self.args, 'use_grayscale') and self.args.use_grayscale and source_data.shape[1] == 3:
+                    source_data = self.rgb_to_grayscale_3channel(source_data)
+
+                # 编码处理
+                if source_data.shape[1] == 3:  # (N, 3, H, W) -> (N, T, 3, H, W)
+                    source_data = self.encoder_dict[self.args.encoder_type](source_data)
+                if target_data.shape[1] == 3:  # (N, 3, H, W) -> (N, T, 3, H, W)
+                    target_data = self.encoder_dict[self.args.encoder_type](target_data)
+
+                source_data, labels = source_data.to(self.device), labels.to(self.device)
+                target_data, labels = target_data.to(self.device), labels.to(self.device)
+
+                source_outputs, target_outputs, encoder_tl_loss, feature_tl_loss = self.network(source_data.float(),
+                                                                                                target_data.float(),
+                                                                                                self.args.encoder_tl_loss_type,
+                                                                                                self.args.feature_tl_loss_type)
+                source_mean_out = source_outputs.mean(1)  # (N, num_classes)
+                source_clf_loss = self.criterion(source_outputs, labels)
+
+                target_mean_out = target_outputs.mean(1)  # (N, num_classes)
+                target_clf_loss = self.criterion(target_outputs, labels)
+
+                loss = source_clf_loss + target_clf_loss
+
+                if self.args.encoder_tl_lamb > 0.0:
+                    loss = loss + self.args.encoder_tl_lamb * encoder_tl_loss
+                if self.args.feature_tl_lamb > 0.0:
+                    loss = loss + self.args.feature_tl_lamb * feature_tl_loss
+
+                source_train_loss += source_clf_loss.item()
+                target_train_loss += target_clf_loss.item()
+                total_encoder_tl_loss += encoder_tl_loss.item()
+                total_feature_tl_loss += feature_tl_loss.item()
+                total_loss += loss.item()
+
+                loss.mean().backward()
+                self.optimizer.step()
+
+                train_num += float(labels.size(0))
+
+                source_acc1, source_acc5 = accuracy(source_mean_out, labels, topk=(1, 5))
+                target_acc1, target_acc5 = accuracy(target_mean_out, labels, topk=(1, 5))
+                source_train_correct += source_acc1
+                source_train_correct5 += source_acc5
+                target_train_correct += target_acc1
+                target_train_correct5 += target_acc5
+
+                # 更新进度条信息
+                current_avg_loss = total_loss / train_num
+                current_rgb_acc = source_train_correct / train_num
+                current_dvs_acc = target_train_correct / train_num
+                
+                # 根据是否使用灰度转换调整显示标签
+                source_label = "Gray_Acc" if (hasattr(self.args, 'use_grayscale') and self.args.use_grayscale) else "RGB_Acc"
+                
+                pbar.set_postfix({
+                    'Loss': f'{current_avg_loss:.4f}',
+                    source_label: f'{current_rgb_acc:.3f}',
+                    'DVS_Acc': f'{current_dvs_acc:.3f}'
+                })
+
+                reset_net(self.network)
+            
+            # 关闭进度条
+            pbar.close()
+
+            self.scheduler.step()
+
+            # 计算平均值
+            source_train_acc1 = source_train_correct / train_num
+            target_train_acc1 = target_train_correct / train_num
+            total_acc = (source_train_acc1 + target_train_acc1) / 2
+            source_train_acc5 = source_train_correct5 / train_num
+            target_train_acc5 = target_train_correct5 / train_num
+            total_acc5 = (source_train_acc5 + target_train_acc5) / 2
+            source_train_loss = source_train_loss / train_num
+            target_train_loss = target_train_loss / train_num
+            total_encoder_tl_loss = total_encoder_tl_loss / train_num
+            total_feature_tl_loss = total_feature_tl_loss / train_num
+            total_loss = total_loss / train_num
+            
+            # 根据是否使用灰度转换调整打印信息
+            source_type = "grayscale" if (hasattr(self.args, 'use_grayscale') and self.args.use_grayscale) else "source"
+            
+            print('Epoch:[{}/{}] time cost: {:.2f}min '
+                  '{}_clf_loss={:.5f} {}_train_acc={:.4f} {}_train_acc5={:.4f} '
+                  'target_clf_loss={:.5f} target_train_acc={:.4f} target_train_acc5={:.4f} '
+                  'total_loss={:.5f} train_acc={:.4f} train_acc5={:.4f} '
+                  'encoder_tl_loss={:.5f} feature_tl_loss={:.5f}'.format(epoch, self.args.epoch,
+                                                                         (time.time() - start) / 60,
+                                                                         source_type, source_train_loss, 
+                                                                         source_type, source_train_acc1,
+                                                                         source_type, source_train_acc5,
+                                                                         target_train_loss, target_train_acc1,
+                                                                         target_train_acc5,
+                                                                         total_loss, total_acc, total_acc5,
+                                                                         total_encoder_tl_loss, total_feature_tl_loss))
+
+            # 梯度监控（如果网络有相应属性）
+            try:
+                grad_data_name = self.network.dvs_input.fwd.module._modules['0']
+                grad_data = self.network.dvs_input.fwd.module._modules['0'].weight.grad
+                print(grad_data_name, grad_data.max(), grad_data.min(), grad_data.mean(), grad_data.std())
+                grad_data_name = self.network.rgb_input.fwd.module._modules['0']
+                grad_data = self.network.rgb_input.fwd.module._modules['0'].weight.grad
+                print(grad_data_name, grad_data.max(), grad_data.min(), grad_data.mean(), grad_data.std())
+            except:
+                pass  # 如果网络结构不同，跳过梯度监控
+
+            # 验证集评估
+            val_loss, val_acc1, val_acc5 = self.test(dvs_val_loader)
+            if type(val_loss) is list:
+                all_val_loss = val_loss
+                val_loss = sum(val_loss) / len(val_loss)
+                all_val_acc1 = val_acc1
+                val_acc1 = sum(val_acc1) / len(val_acc1)
+                all_val_acc5 = val_acc5
+                val_acc5 = sum(val_acc5) / len(val_acc5)
+
+                print(f'Epoch:[{epoch}/{self.args.epoch}] val_loss={val_loss:.5f} val_acc1={val_acc1:.4f} ' \
+                      f'all_val_acc1={all_val_acc1} val_acc5={val_acc5:.4f} all_val_acc5={all_val_acc5}')
+
+                self.writer.add_scalar(tag="train/source_accuracy1", scalar_value=source_train_acc1, global_step=epoch)
+                self.writer.add_scalar(tag="train/source_accuracy5", scalar_value=source_train_acc5, global_step=epoch)
+                self.writer.add_scalar(tag="train/source_loss", scalar_value=source_train_loss, global_step=epoch)
+                self.writer.add_scalar(tag="train/target_accuracy1", scalar_value=target_train_acc1, global_step=epoch)
+                self.writer.add_scalar(tag="train/target_accuracy5", scalar_value=target_train_acc5, global_step=epoch)
+                self.writer.add_scalar(tag="train/target_loss", scalar_value=target_train_loss, global_step=epoch)
+                self.writer.add_scalar(tag="train/accuracy1", scalar_value=total_acc, global_step=epoch)
+                self.writer.add_scalar(tag="train/accuracy5", scalar_value=total_acc5, global_step=epoch)
+                self.writer.add_scalar(tag="train/loss", scalar_value=total_loss, global_step=epoch)
+                self.writer.add_scalar(tag="train/encoder_tl_loss", scalar_value=total_encoder_tl_loss,
+                                       global_step=epoch)
+                self.writer.add_scalar(tag="train/feature_tl_loss", scalar_value=total_feature_tl_loss,
+                                       global_step=epoch)
+                self.writer.add_scalar(tag="train/lr", scalar_value=self.optimizer.param_groups[0]['lr'],
+                                       global_step=epoch)
+                self.writer.add_scalar(tag="val/accuracy1", scalar_value=val_acc1, global_step=epoch)
+                self.writer.add_scalar(tag="val/accuracy5", scalar_value=val_acc5, global_step=epoch)
+                self.writer.add_scalar(tag="val/loss", scalar_value=val_loss, global_step=epoch)
+                for val_id in range(len(all_val_loss)):
+                    self.writer.add_scalar(tag=f"val{val_id + 1}/accuracy1", scalar_value=all_val_acc1[val_id],
+                                           global_step=epoch)
+                    self.writer.add_scalar(tag=f"val{val_id + 1}/accuracy5", scalar_value=all_val_acc5[val_id],
+                                           global_step=epoch)
+                    self.writer.add_scalar(tag=f"val{val_id + 1}/loss", scalar_value=all_val_loss[val_id],
+                                           global_step=epoch)
+            else:
+                print(f'Epoch:[{epoch}/{self.args.epoch}] val_loss={val_loss:.5f} '
+                      f'val_acc1={val_acc1:.4f} val_acc5={val_acc5:.4f}')
+
+                self.writer.add_scalar(tag="train/source_accuracy1", scalar_value=source_train_acc1, global_step=epoch)
+                self.writer.add_scalar(tag="train/source_accuracy5", scalar_value=source_train_acc5, global_step=epoch)
+                self.writer.add_scalar(tag="train/source_loss", scalar_value=source_train_loss, global_step=epoch)
+                self.writer.add_scalar(tag="train/target_accuracy1", scalar_value=target_train_acc1, global_step=epoch)
+                self.writer.add_scalar(tag="train/target_accuracy5", scalar_value=target_train_acc5, global_step=epoch)
+                self.writer.add_scalar(tag="train/target_loss", scalar_value=target_train_loss, global_step=epoch)
+                self.writer.add_scalar(tag="train/accuracy1", scalar_value=total_acc, global_step=epoch)
+                self.writer.add_scalar(tag="train/accuracy5", scalar_value=total_acc5, global_step=epoch)
+                self.writer.add_scalar(tag="train/loss", scalar_value=total_loss, global_step=epoch)
+                self.writer.add_scalar(tag="train/encoder_tl_loss", scalar_value=total_encoder_tl_loss,
+                                       global_step=epoch)
+                self.writer.add_scalar(tag="train/feature_tl_loss", scalar_value=total_feature_tl_loss,
+                                       global_step=epoch)
+                self.writer.add_scalar(tag="train/lr", scalar_value=self.optimizer.param_groups[0]['lr'],
+                                       global_step=epoch)
+                self.writer.add_scalar(tag="val/accuracy1", scalar_value=val_acc1, global_step=epoch)
+                self.writer.add_scalar(tag="val/accuracy5", scalar_value=val_acc5, global_step=epoch)
+                self.writer.add_scalar(tag="val/loss", scalar_value=val_loss, global_step=epoch)
+
+            if self.best_train_acc < target_train_acc1:
+                self.best_train_acc = target_train_acc1
+
+            if self.best_val_acc < val_acc1:
+                self.best_val_acc = val_acc1
+                self.save_model(epoch)
+
+            print(f"Best train acc is {self.best_train_acc}, best val acc is: {self.best_val_acc}.")
+
+            # 内存监控
+            info = psutil.virtual_memory()
+            print(info)
+            print(u'电脑总内存：%.4f GB' % (info.total / 1024 / 1024 / 1024))
+            print(u'available：%.4f GB' % (info.available / 1024 / 1024 / 1024))
+            print(u'used：%.4f GB' % (info.used / 1024 / 1024 / 1024))
+            print(u'free：%.4f GB' % (info.free / 1024 / 1024 / 1024))
+            print(u'当前使用的总内存占比：', info.percent)
+            print("------------------------------------------------------")
+
         return self.best_train_acc, self.best_val_acc

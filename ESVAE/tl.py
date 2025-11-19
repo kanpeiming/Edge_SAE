@@ -134,14 +134,14 @@ if __name__ == "__main__":
     model = VGGSNN(cls_num=10, img_shape=32, device='cuda')
 
     # 加载预训练参数
-    pretrained_model_path = '/home/user/kpm/kpm/results/SDSTL/pretrain/checkpoints/CIFAR10_10_Feature-Alignment_CIFAR10_enc-time_encoder_opt-Adam_lr0.001_T10_seed1000_2Edge/best_model.pth'  # 替换为你的模型文件路径
-    # model.load_state_dict(torch.load(pretrained_model_path), strict=False)
-    # pretrained_model = torch.load(pretrained_model_path, weights_only=True)
-    model_dict = model.state_dict()
-    pretrained_model_dict = {key: value for key, value in model_dict.items() if (key in model_dict and 'bottleneck' not in key and 'classifier' not in key and 'rgb_input' not in key and 'dvs_input' not in key )}
-    model_dict.update(pretrained_model_dict)
-    model.load_state_dict(model_dict)
-    model.load_state_dict(torch.load(pretrained_model_path, weights_only=True), strict=False)
+    # pretrained_model_path = '/home/user/kpm/kpm/results/SDSTL/pretrain/checkpoints/CIFAR10_10_Feature-Alignment_CIFAR10_enc-time_encoder_opt-Adam_lr0.001_T10_seed1000_2Edge/best_model.pth'  # 替换为你的模型文件路径
+    # # model.load_state_dict(torch.load(pretrained_model_path), strict=False)
+    # # pretrained_model = torch.load(pretrained_model_path, weights_only=True)
+    # model_dict = model.state_dict()
+    # pretrained_model_dict = {key: value for key, value in model_dict.items() if (key in model_dict and 'bottleneck' not in key and 'classifier' not in key and 'rgb_input' not in key and 'dvs_input' not in key )}
+    # model_dict.update(pretrained_model_dict)
+    # model.load_state_dict(model_dict)
+    # model.load_state_dict(torch.load(pretrained_model_path, weights_only=True), strict=False)
 
     if args.parallel:
         model = torch.nn.DataParallel(model)
