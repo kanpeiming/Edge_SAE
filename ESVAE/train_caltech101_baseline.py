@@ -82,7 +82,7 @@ args.data_set = 'Caltech101'
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 # 日志名称 加载预训练参数，改变一下命名为微调
-log_name = f"Fine-tuning_NCaltech101_baseline_lr{args.lr}_T{args.T}_bs{args.batch_size}_seed{args.seed}"
+log_name = f"PretrainT4_Fine-tuning_NCaltech101_baseline_lr{args.lr}_T{args.T}_bs{args.batch_size}_seed{args.seed}"
 
 # 创建日志和检查点目录
 os.makedirs(args.log_dir, exist_ok=True)

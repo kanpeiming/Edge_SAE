@@ -41,7 +41,7 @@ parser.add_argument('--optim', default='Adam', type=str, choices=['SGD', 'Adam']
 parser.add_argument('--lr', default=0.001, type=float,
                     help='Learning rate')  # 增加学习率以加快收敛
 parser.add_argument('--weight_decay', default=5e-4, type=float, help='Weight decay')
-parser.add_argument('--epoch', default=80, type=int, help='Training epochs')
+parser.add_argument('--epoch', default=100, type=int, help='Training epochs')
 parser.add_argument('--device', default='cuda', type=str, help='cuda or cpu')
 parser.add_argument('--parallel', default=False, type=bool, help='Whether to use multi-GPU parallelism')
 parser.add_argument('--T', default=10, type=int, help='snn simulation time (default: 10)')
@@ -119,19 +119,6 @@ writer = SummaryWriter(log_dir=log_dir)
 print(log_name)
 print(writer.log_dir)
 
-# 打印改进信息
-print("\n=== 训练改进策略 ===")
-print(f"✓ 图像分辨率: 32×32 (保持原始尺寸，避免瓶颈层维度问题)")
-if args.use_grayscale:
-    print("✓ RGB转灰度: 启用 (保持三通道，验证结构迁移假设)")
-else:
-    print("○ RGB转灰度: 未启用 (使用原始色彩信息)")
-if args.use_cutout:
-    print(f"✓ Cutout增强: 启用 (长度={args.cutout_length})")
-else:
-    print("○ Cutout增强: 未启用")
-print("===================\n")
-
 if __name__ == "__main__":
     common_utils.seed_all(args.seed)
     f = open(f"{args.data_set}_{args.seed}_rgb2dvs_result.txt", "a")
@@ -193,18 +180,25 @@ if __name__ == "__main__":
         raise NotImplementedError(f"Dataset {args.data_set} not implemented for RGB2DVS transfer")
 
     # preparing model - 选择模型（支持2种组合）
+    # 根据数据集设置图像尺寸 - 与tl.py保持完全一致
+    if args.data_set == 'CIFAR10':
+        img_shape = 48  # 与tl.py一致：CIFAR10使用32x32（虽然数据加载器resize到48，但模型使用32）
+    elif args.data_set == 'MNIST':
+        img_shape = 32  # N-MNIST: 32x32 (resized from 28x28)
+    elif args.data_set == 'Caltech101':
+        img_shape = 48  # N-Caltech101: 48x48
+    else:
+        img_shape = 48  # 默认使用48
+    
     if args.use_woap:
         from pretrain.pretrainModel import VGGSNNwoAP
-        model = VGGSNNwoAP(cls_num=args.num_classes, img_shape=32)
+        model = VGGSNNwoAP(cls_num=args.num_classes, img_shape=img_shape)
         print("使用标准VGGSNNwoAP模型 (without Average Pooling)")
         print("  架构: stride=2卷积替代AvgPool2d")
-        print("  图像尺寸: 32×32")
-        print("  瓶颈层: LIFSpike独立")
+        print(f"  图像尺寸: {img_shape}×{img_shape}")
+        print("  瓶颈层: 与tl.py完全一致（bottleneck包含LIFSpike + bottleneck_lif_node再次激活）")
     else:
-        model = VGGSNN(cls_num=args.num_classes, img_shape=32, device=device)
-        print("使用标准VGGSNN模型 (with Average Pooling)")
-        print("  架构: AvgPool2d下采样")
-        print("  图像尺寸: 32×32")
+        model = VGGSNN(cls_num=args.num_classes, img_shape=img_shape, device=device)
 
     if args.parallel:
         model = torch.nn.DataParallel(model)

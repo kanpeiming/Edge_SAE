@@ -3,7 +3,7 @@ import bisect
 import torch
 import random
 from collections import Counter
-from dataloader.dataloader_utils import *
+from .dataloader_utils import *
 from torchvision import datasets, transforms
 from spikingjelly.datasets import n_caltech101
 from torch.utils.data import Dataset, random_split
@@ -12,7 +12,7 @@ from torch.utils.data.sampler import SubsetRandomSampler
 
 # your own data dir
 USER_NAME = 'zhan'
-DIR = {'Caltech101': f'/home/user/kpm/kpm/Dataset/Caltech101/caltech101',
+DIR = {'Caltech101': f'/home/user/kpm/kpm/Dataset/Caltech101/caltech101/101_ObjectCategories',
        'Caltech101DVS': f'/home/user/kpm/kpm/Dataset/Caltech101/n-caltech101',
        'Caltech101DVS_CATCH': f'/data/{USER_NAME}/Event_Camera_Datasets/Caltech101/NCaltech101_dst_cache'
        }
@@ -25,12 +25,12 @@ def get_tl_caltech101(batch_size, train_set_ratio=1.0, dvs_train_set_ratio=1.0):
     :return: train_loader, test_loader
     """
     rgb_trans_train = transforms.Compose([
-                                          transforms.Resize((52, 52)),  # 先resize到稍大尺寸
-                                          transforms.RandomCrop(48, padding=2),  # 随机裁剪到48x48
-                                          transforms.RandomHorizontalFlip(p=0.5), # 概率50%水平翻转
-                                          transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1), # 随机的颜色调整
+                                          transforms.Resize((48, 48)),  # resize
+                                          # transforms.RandomCrop(48, padding=2),  # 随机裁剪到48x48
+                                          # transforms.RandomHorizontalFlip(p=0.5), # 概率50%水平翻转
+                                          # transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1), # 随机的颜色调整
                                           transforms.ToTensor(),
-                                          transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),  # ImageNet标准归一化
+                                          transforms.Normalize((0.5429, 0.5263, 0.4994), (0.2422, 0.2392, 0.2406)),  # 归一化
                                       ])
     # rgb_trans_test = transforms.Compose([transforms.Resize(48, 48),
     #                                      transforms.ToTensor(),
@@ -72,10 +72,10 @@ def get_caltech101(batch_size, train_set_ratio=1.0):
     
     trans_train = transforms.Compose([
                                       GrayscaleToRGB(),  # 确保所有图像都是RGB格式
-                                      transforms.Resize((56, 56)),
-                                      transforms.RandomHorizontalFlip(p=0.5), # 概率50%水平翻转
-                                      transforms.RandomRotation((-15,15)), # 随机旋转，角度范围为 -15° – 15°
-                                      transforms.ColorJitter(), # 随机的颜色调整
+                                      # transforms.Resize((56, 56)),
+                                      # transforms.RandomHorizontalFlip(p=0.5), # 概率50%水平翻转
+                                      # transforms.RandomRotation((-15,15)), # 随机旋转，角度范围为 -15° – 15°
+                                      # transforms.ColorJitter(), # 随机的颜色调整
                                       transforms.Resize((48, 48)),
                                       transforms.ToTensor(),
                                       transforms.Normalize((0.5429, 0.5263, 0.4994), (0.2422, 0.2392, 0.2406)),  # RGB归一化
@@ -86,17 +86,75 @@ def get_caltech101(batch_size, train_set_ratio=1.0):
                                      transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))]) 
 
     # 使用本地准备好的数据集
-    # 数据集路径: /home/user/kpm/kpm/Dataset/Caltech101/caltech-101
+    # 数据集路径: /home/user/kpm/kpm/Dataset/Caltech101/caltech101/101_ObjectCategories
     # PyTorch期望的结构: root/101_ObjectCategories/类别名/图片
-    caltech101_root = os.path.dirname(DIR['Caltech101'])  # /home/user/kpm/kpm/Dataset/Caltech101
+    # datasets.Caltech101 需要的是包含 101_ObjectCategories 的父目录
+    caltech101_root = os.path.dirname(DIR['Caltech101'])  # /home/user/kpm/kpm/Dataset/Caltech101/caltech101
     
     # 检查本地数据集是否存在
     if not os.path.exists(DIR['Caltech101']):
         raise FileNotFoundError(f"数据集目录不存在: {DIR['Caltech101']}")
     
-    # 使用本地数据集，不下载
-    train_data = datasets.Caltech101(caltech101_root, transform=trans_train, download=False)
-    test_data = datasets.Caltech101(caltech101_root, transform=trans_test, download=False) 
+    # 检查并解压 Annotations.tar（torchvision 需要）
+    annotations_dir = os.path.join(caltech101_root, 'Annotations')
+    annotations_tar = os.path.join(caltech101_root, 'Annotations.tar')
+    
+    if not os.path.exists(annotations_dir) and os.path.exists(annotations_tar):
+        # 静默解压 Annotations.tar
+        import tarfile
+        with tarfile.open(annotations_tar, 'r') as tar:
+            tar.extractall(path=caltech101_root)
+    
+    # 优先尝试使用 torchvision 自带的 Caltech101 类
+    # 如果因为 MD5 校验或其他原因被认为“损坏”，则回退到 ImageFolder 方式加载
+    try:
+        train_data = datasets.Caltech101(caltech101_root, transform=trans_train, download=False)
+        test_data = datasets.Caltech101(caltech101_root, transform=trans_test, download=False)
+    except RuntimeError:
+        # 静默回退到 ImageFolder 加载方式
+        # 注意：需要过滤掉 BACKGROUND_Google 类别（如果存在）
+        from torch.utils.data import Subset
+        
+        full_train_data = datasets.ImageFolder(DIR['Caltech101'], transform=trans_train)
+        full_test_data = datasets.ImageFolder(DIR['Caltech101'], transform=trans_test)
+        
+        # 检查类别数量，如果是102则需要过滤
+        if len(full_train_data.classes) == 102:
+            # 找到 BACKGROUND_Google 的索引并过滤
+            bg_idx = full_train_data.class_to_idx.get('BACKGROUND_Google', -1)
+            if bg_idx != -1:
+                # 过滤掉 BACKGROUND_Google 类别的样本
+                train_indices = [i for i, (_, label) in enumerate(full_train_data.samples) if label != bg_idx]
+                test_indices = [i for i, (_, label) in enumerate(full_test_data.samples) if label != bg_idx]
+                
+                train_data = Subset(full_train_data, train_indices)
+                test_data = Subset(full_test_data, test_indices)
+                
+                # 重新映射标签：将 [0-100, 102] 映射到 [0-100]
+                # 创建包装器来调整标签
+                class LabelRemapDataset(torch.utils.data.Dataset):
+                    def __init__(self, subset, bg_idx):
+                        self.subset = subset
+                        self.bg_idx = bg_idx
+                    
+                    def __getitem__(self, idx):
+                        img, label = self.subset[idx]
+                        # 如果标签大于 bg_idx，减1以填补空缺
+                        if label > self.bg_idx:
+                            label = label - 1
+                        return img, label
+                    
+                    def __len__(self):
+                        return len(self.subset)
+                
+                train_data = LabelRemapDataset(train_data, bg_idx)
+                test_data = LabelRemapDataset(test_data, bg_idx)
+            else:
+                train_data = full_train_data
+                test_data = full_test_data
+        else:
+            train_data = full_train_data
+            test_data = full_test_data
 
     # take train set by train_set_ratio
     n_train = len(train_data)
@@ -115,6 +173,131 @@ def get_caltech101(batch_size, train_set_ratio=1.0):
                                   pin_memory=True)
 
     return train_dataloader, test_dataloader
+
+
+def get_caltech101_gray(batch_size, train_set_ratio=1.0):
+    """
+    获取Caltech101灰度图数据加载器（用于消融实验2）
+    将RGB图像转换为灰度图，然后扩展为3通道（复制灰度值）以适配模型
+    
+    Args:
+        batch_size: 批次大小
+        train_set_ratio: 训练集使用比例
+    
+    Returns:
+        train_dataloader, test_dataloader
+    """
+    # 自定义变换类：将图像转为灰度图，然后扩展为3通道
+    class GrayscaleToThreeChannel:
+        def __call__(self, img):
+            # 转换为灰度图
+            if img.mode != 'L':
+                img = img.convert('L')  # 转换为灰度图
+            # 扩展为3通道（复制灰度值）
+            img = img.convert('RGB')  # 将灰度图扩展为3通道RGB
+            return img
+    
+    trans_train = transforms.Compose([
+                                      GrayscaleToThreeChannel(),  # 转为灰度图并扩展为3通道
+                                      transforms.Resize((56, 56)),
+                                      transforms.RandomHorizontalFlip(p=0.5), # 概率50%水平翻转
+                                      transforms.RandomRotation((-15,15)), # 随机旋转，角度范围为 -15° – 15°
+                                      transforms.Resize((48, 48)),
+                                      transforms.ToTensor(),
+                                      # 使用灰度图的归一化参数（3个通道使用相同的值）
+                                      transforms.Normalize((0.5, 0.5, 0.5), (0.25, 0.25, 0.25)),
+                                      ])
+    trans_test = transforms.Compose([GrayscaleToThreeChannel(),  # 转为灰度图并扩展为3通道
+                                     transforms.Resize((48, 48)),
+                                     transforms.ToTensor(),
+                                     transforms.Normalize((0.5, 0.5, 0.5), (0.25, 0.25, 0.25))]) 
+
+    # 使用本地准备好的数据集
+    caltech101_root = os.path.dirname(DIR['Caltech101'])  # /home/user/kpm/kpm/Dataset/Caltech101/caltech101
+    
+    # 检查本地数据集是否存在
+    if not os.path.exists(DIR['Caltech101']):
+        raise FileNotFoundError(f"数据集目录不存在: {DIR['Caltech101']}")
+    
+    # 检查并解压 Annotations.tar（torchvision 需要）
+    annotations_dir = os.path.join(caltech101_root, 'Annotations')
+    annotations_tar = os.path.join(caltech101_root, 'Annotations.tar')
+    
+    if not os.path.exists(annotations_dir) and os.path.exists(annotations_tar):
+        # 静默解压 Annotations.tar
+        import tarfile
+        with tarfile.open(annotations_tar, 'r') as tar:
+            tar.extractall(path=caltech101_root)
+    
+    # 优先尝试使用 torchvision 自带的 Caltech101 类
+    # 如果因为 MD5 校验或其他原因被认为"损坏"，则回退到 ImageFolder 方式加载
+    try:
+        train_data = datasets.Caltech101(caltech101_root, transform=trans_train, download=False)
+        test_data = datasets.Caltech101(caltech101_root, transform=trans_test, download=False)
+    except RuntimeError:
+        # 静默回退到 ImageFolder 加载方式
+        # 注意：需要过滤掉 BACKGROUND_Google 类别（如果存在）
+        from torch.utils.data import Subset
+        
+        full_train_data = datasets.ImageFolder(DIR['Caltech101'], transform=trans_train)
+        full_test_data = datasets.ImageFolder(DIR['Caltech101'], transform=trans_test)
+        
+        # 检查类别数量，如果是102则需要过滤
+        if len(full_train_data.classes) == 102:
+            # 找到 BACKGROUND_Google 的索引并过滤
+            bg_idx = full_train_data.class_to_idx.get('BACKGROUND_Google', -1)
+            if bg_idx != -1:
+                # 过滤掉 BACKGROUND_Google 类别的样本
+                train_indices = [i for i, (_, label) in enumerate(full_train_data.samples) if label != bg_idx]
+                test_indices = [i for i, (_, label) in enumerate(full_test_data.samples) if label != bg_idx]
+                
+                train_data = Subset(full_train_data, train_indices)
+                test_data = Subset(full_test_data, test_indices)
+                
+                # 重新映射标签：将 [0-100, 102] 映射到 [0-100]
+                # 创建包装器来调整标签
+                class LabelRemapDataset(torch.utils.data.Dataset):
+                    def __init__(self, subset, bg_idx):
+                        self.subset = subset
+                        self.bg_idx = bg_idx
+                    
+                    def __getitem__(self, idx):
+                        img, label = self.subset[idx]
+                        # 如果标签大于 bg_idx，减1以填补空缺
+                        if label > self.bg_idx:
+                            label = label - 1
+                        return img, label
+                    
+                    def __len__(self):
+                        return len(self.subset)
+                
+                train_data = LabelRemapDataset(train_data, bg_idx)
+                test_data = LabelRemapDataset(test_data, bg_idx)
+            else:
+                train_data = full_train_data
+                test_data = full_test_data
+        else:
+            train_data = full_train_data
+            test_data = full_test_data 
+
+    # take train set by train_set_ratio
+    n_train = len(train_data)
+    split = int(n_train * train_set_ratio)
+    indices = list(range(n_train))
+    random.shuffle(indices)
+    train_sampler = SubsetRandomSampler(indices[:split])
+
+    if train_set_ratio < 1.0:
+        train_dataloader = DataLoaderX(train_data, batch_size=batch_size, shuffle=False, num_workers=8, drop_last=True,
+                                       sampler=train_sampler, pin_memory=True)
+    else:
+        train_dataloader = DataLoaderX(train_data, batch_size=batch_size, shuffle=True, num_workers=8, drop_last=True,
+                                       pin_memory=True)
+    test_dataloader = DataLoaderX(test_data, batch_size=batch_size, shuffle=True, num_workers=8, drop_last=False,
+                                  pin_memory=True)
+
+    return train_dataloader, test_dataloader
+
 
 def get_n_caltech101(batch_size,T,split_ratio=0.9,train_set_ratio=1.0,size=224,encode_type='TET'):
     if encode_type is "spikingjelly":
@@ -245,8 +428,9 @@ class TLCaltech101(Dataset):
         else:
             self.dvs_root = os.path.join(dvs_root, 'test')
 
-        # 初始化RGB数据（RGB数据没有train/test划分，总是加载全部）
-        self._load_rgb_data()
+        # 初始化RGB数据（仅在训练模式下加载，测试模式只用DVS）
+        if self.train:
+            self._load_rgb_data()
         
         # 初始化DVS数据（根据train/test模式加载对应的DVS数据）
         self._load_dvs_data()
@@ -272,8 +456,6 @@ class TLCaltech101(Dataset):
         if len(self.categories) == 0:
             raise FileNotFoundError(f"在 {self.root} 中未找到有效类别目录")
         
-        print(f"发现 {len(all_dirs)} 个目录，过滤后保留 {len(self.categories)} 个类别")
-        
         self.rgb_data = []
         self.y = []
         self.index = []
@@ -289,7 +471,7 @@ class TLCaltech101(Dataset):
                 self.y.append(class_idx)
                 self.index.append(img_idx)
         
-        print(f"✓ 加载RGB数据: {len(self.categories)} 个类别，{len(self.rgb_data)} 张图像")
+        print(f"✓ RGB: {len(self.categories)} 类, {len(self.rgb_data)} 样本")
         self.cumulative_sizes = self.cumsum(self.y)
 
     def _load_dvs_data(self):
@@ -333,15 +515,11 @@ class TLCaltech101(Dataset):
                     target = target.item() if target.numel() == 1 else target[0].item()
                 self.dvs_targets.append(int(target))
                 
-                # 调试：打印前几个文件的数据形状
-                if i < 3:
-                    print(f"  DVS样本 {i}: 形状={data.shape}, 标签={target}, 数据类型={data.dtype}")
-                    
             except Exception as e:
                 print(f"警告: 无法加载DVS文件 {file_name}: {e}")
                 continue
         
-        print(f"✓ 加载DVS数据 ({mode}): {len(self.dvs_data)} 个样本")
+        print(f"✓ DVS ({mode}): {len(self.dvs_data)} 样本")
         
         # 构建DVS的累积大小（按类别）
         self.dvs_cumulative_sizes = self.cumsum(self.dvs_targets)
@@ -436,34 +614,40 @@ class TLCaltech101(Dataset):
     def dvs_trans(self, dvs_img):
         """
         DVS数据变换
-        DVS数据应该是2通道 (正负极性)，形状为 (T, 2, H, W)
+        DVS数据可能是 (C, H, W, T) 或 (T, C, H, W) 格式
+        需要统一转换为 (T, C, H, W) 格式，其中 C=2 (正负极性)
         """
         # 检查DVS数据形状并进行必要的重塑
         original_shape = dvs_img.shape
         
-        # 如果形状不符合预期，尝试重塑
+        # 处理不同的输入格式
         if len(original_shape) == 4:
-            T, C, H, W = original_shape
-            # 如果通道数异常，可能需要重新整形
-            if C > 4:  # 通道数异常大
-                # 尝试重新整形为 (T, 2, H, W)
+            # 判断数据格式：(C, H, W, T) 还是 (T, C, H, W)
+            if original_shape[0] == 2 and original_shape[3] >= 10:
+                # 格式是 (C=2, H, W, T)，需要转换为 (T, C, H, W)
+                C, H, W, T = original_shape
+                dvs_img = dvs_img.permute(3, 0, 1, 2)  # (C, H, W, T) -> (T, C, H, W)
+                # print(f"转换DVS数据格式: {original_shape} -> {dvs_img.shape}")
+            elif original_shape[1] == 2:
+                # 格式已经是 (T, C=2, H, W)，无需转换
+                T, C, H, W = original_shape
+            else:
+                # 通道数异常，尝试重新整形
+                print(f"警告: DVS数据形状异常 {original_shape}，尝试重塑...")
                 total_elements = dvs_img.numel()
-                # 假设T=10, C=2 (DVS标准)
                 T_target = 10
                 C_target = 2
-                # 计算H和W
                 remaining = total_elements // (T_target * C_target)
                 H_target = W_target = int(remaining ** 0.5)
                 
                 try:
                     dvs_img = dvs_img.view(T_target, C_target, H_target, W_target)
-                    # print(f"重塑DVS数据: {original_shape} -> {dvs_img.shape}")
+                    print(f"重塑DVS数据: {original_shape} -> {dvs_img.shape}")
                 except:
-                    # 如果重塑失败，创建默认的DVS数据
-                    # print(f"警告: 无法重塑DVS数据 {original_shape}，使用默认数据")
+                    print(f"错误: 无法重塑DVS数据 {original_shape}，使用默认数据")
                     dvs_img = torch.zeros(10, 2, 48, 48)
         
-        # 现在应该是正确的形状 (T, 2, H, W)
+        # 现在应该是正确的形状 (T, C, H, W)
         T, C, H, W = dvs_img.shape
         
         # 对每个时间步进行变换

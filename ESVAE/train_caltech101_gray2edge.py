@@ -1,0 +1,254 @@
+# -*- coding: utf-8 -*-
+"""
+Caltech101 Gray to Edge knowledge transfer pretraining script
+灰度图到边缘信息的迁移学习预训练脚本
+
+消融实验（2）：预训练阶段，将RGB转为Gray，再进行Gray到GrayEdge的对齐
+目的：验证色彩的效果
+预期：通过对比SDSTL，验证色彩信息的重要性
+
+使用方法：
+1. 预训练Gray->Edge模型：
+   python train_caltech101_gray2edge.py --epochs 50 --lr 0.001 --batch_size 32
+
+2. 使用预训练参数进行DVS微调：
+   python train_caltech101_baseline.py --pretrained_path /path/to/gray_edge_pretrained_best.pth
+"""
+
+import argparse
+import os
+import sys
+import torch
+from torch.utils.tensorboard import SummaryWriter
+
+# 添加ESVAE根目录到Python路径
+current_dir = os.path.dirname(os.path.abspath(__file__))
+esvae_root = os.path.dirname(current_dir)  # 上一级目录
+if esvae_root not in sys.path:
+    sys.path.insert(0, esvae_root)
+
+from dataloader.caltech101 import get_caltech101_gray
+from pretrain.pretrainer import AlignmentTLTrainer_Edge_1
+from pretrain.pretrainModel import VGGSNN, VGGSNNwoAP
+from pretrain.Edge import SobelEdgeExtractionModule, CannyEdgeDetectionModule
+from tl_utils.loss_function import TET_loss
+from tl_utils import common_utils
+
+parser = argparse.ArgumentParser(description='Caltech101 Gray->Edge Pretraining (Ablation Study 2)')
+parser.add_argument('--batch_size', default=32, type=int, help='Batchsize')
+parser.add_argument('--optim', default='Adam', type=str, choices=['SGD', 'Adam'], help='Optimizer')
+parser.add_argument('--lr', default=0.001, type=float, help='Learning rate for Gray->Edge pretraining')
+parser.add_argument('--weight_decay', default=5e-4, type=float, help='Weight decay')
+parser.add_argument('--epochs', default=50, type=int, help='Gray->Edge pretraining epochs')
+parser.add_argument('--device', default='cuda', type=str, help='cuda or cpu')
+parser.add_argument('--parallel', default=False, type=bool, help='Whether to use multi-GPU parallelism')
+parser.add_argument('--T', default=10, type=int, help='snn simulation time (default: 10)')
+parser.add_argument('--encoder_type', type=str, default='time_encoder',
+                    choices=['lap_encoder', 'poison_encoder', 'time_encoder'],
+                    help='the encoder type of gray data for snn.')
+parser.add_argument('--seed', type=int, default=1000, help='seed for initializing training.')
+parser.add_argument('--encoder_tl_loss_type', type=str, default='CKA', choices=['TCKA', 'CKA'],
+                    help='the transfer loss for encoder.')
+parser.add_argument('--feature_tl_loss_type', type=str, default='TCKA',
+                    choices=['TCKA', 'CKA', 'TMSE', 'MSE', 'TMMD', 'MMD'],
+                    help='the transfer loss for features.')
+parser.add_argument('--encoder_tl_lamb', default=0.1, type=float,
+                    help='encoder transfer learning loss ratio')
+parser.add_argument('--feature_tl_lamb', default=0.1, type=float,
+                    help='feature transfer learning loss ratio')
+parser.add_argument('--use_woap', default=False, type=bool,
+                    help='Whether to use without Average Pooling version')
+parser.add_argument('--log_dir', type=str, default='/home/user/kpm/kpm/results/SDSTL/wo/log_dir',
+                    help='the path of tensorboard dir.')
+parser.add_argument('--checkpoint', type=str, default='/home/user/kpm/kpm/results/SDSTL/wo/checkpoints',
+                    help='the path of checkpoint dir.')
+parser.add_argument('--GPU_id', type=int, default=0, help='the id of used GPU.')
+parser.add_argument('--Gray_sample_ratio', type=float, default=1.0, help='the ratio of used Gray training set.')
+
+args = parser.parse_args()
+
+# 固定Caltech101参数
+args.data_set = 'Caltech101'
+args.num_classes = 101
+
+device = torch.device(f"cuda:{args.GPU_id}")
+
+# 生成日志名称
+log_name = (
+    f"Caltech101_Gray2Edge_Pretrain_"
+    f"{'woAP' if args.use_woap else 'AP'}_"
+    f"enc-{args.encoder_type}_"
+    f"opt-{args.optim}_"
+    f"lr{args.lr}_"
+    f"T{args.T}_"
+    f"seed{args.seed}_"
+    f"Gray{args.Gray_sample_ratio}_"
+    f"SobelCannyEdge"  # 标记使用了Sobel+Canny双边缘提取器
+)
+
+# 日志目录设置
+log_dir = os.path.join(
+    args.log_dir,
+    f"Caltech101_GrayEdgePretrain_{args.num_classes}",
+    log_name
+)
+
+# 模型保存路径
+checkpoint_dir = os.path.join(
+    args.checkpoint,
+    f"Caltech101_GrayEdgePretrain_{args.num_classes}_{log_name}"
+)
+
+# 递归创建目录
+os.makedirs(log_dir, exist_ok=True)
+os.makedirs(checkpoint_dir, exist_ok=True)
+
+# 设置模型保存路径
+model_path = checkpoint_dir
+writer = SummaryWriter(log_dir=log_dir)
+
+print(f"训练配置: {log_name}")
+print(f"日志目录: {writer.log_dir}")
+print(f"模型保存: {model_path}")
+
+if __name__ == "__main__":
+    common_utils.seed_all(args.seed)
+    f = open(f"Caltech101_{args.seed}_gray2edge_pretrain_result.txt", "a")
+
+    print("\n" + "="*80)
+    print("Gray->Edge预训练 (消融实验2: 使用灰度图验证色彩效果)")
+    print("="*80)
+    
+    # 准备Gray数据 (用于Gray->Edge预训练)
+    print("Loading Caltech101 Gray dataset for Gray->Edge pretraining...")
+    gray_train_loader, gray_test_loader = get_caltech101_gray(
+        args.batch_size, 
+        args.Gray_sample_ratio
+    )
+    
+    print(f"\n=== Gray->Edge预训练数据集信息 ===")
+    print(f"Gray训练集数量: {len(gray_train_loader.dataset)}")
+    print(f"Gray测试集数量: {len(gray_test_loader.dataset)}")
+    print(f"类别数量: {args.num_classes}")
+    print(f"训练模式: Gray作为源域 -> Gray边缘信息作为目标域")
+    print(f"Gray通道扩展: 1通道灰度图 -> 3通道 (复制通道以适配模型)")
+    print("===========================\n")
+
+    # 准备模型 - 选择标准VGGSNN模型
+    if args.use_woap:
+        model = VGGSNNwoAP(cls_num=args.num_classes, img_shape=48)  # Caltech101使用48x48
+        print("使用VGGSNNwoAP模型 (without Average Pooling)")
+        print("  架构: stride=2卷积替代AvgPool2d")
+        print("  图像尺寸: 48×48")
+        print("  输入通道: Gray=3通道(扩展), Edge=2通道(Sobel+Canny)")
+    else:
+        model = VGGSNN(cls_num=args.num_classes, img_shape=48, device=device)  # Caltech101使用48x48
+        print("使用标准VGGSNN模型 (with Average Pooling)")
+        print("  架构: AvgPool2d下采样")
+        print("  图像尺寸: 48×48")
+        print("  输入通道: Gray=3通道(扩展), Edge=2通道(Sobel+Canny)")
+
+    # 为模型添加边缘提取器
+    model.edge_extractor1 = SobelEdgeExtractionModule(device=device, in_channels=3)
+    model.edge_extractor2 = CannyEdgeDetectionModule(device=device, in_channels=3)
+    
+    print("✓ 已添加双边缘提取器:")
+    print("  - edge_extractor1: Sobel边缘检测 (输出1通道)")
+    print("  - edge_extractor2: Canny边缘检测 (输出1通道)")
+    print("  - 叠加后: 2通道边缘图，近似DVS双通道特性")
+    print("  - 灰度图通道扩展: 1通道 -> 3通道 (复制以适配RGB输入层)")
+
+    if args.parallel and torch.cuda.device_count() > 1:
+        print(f"使用 {torch.cuda.device_count()} 个GPU进行训练")
+        model = torch.nn.DataParallel(model)
+    
+    model.to(device)
+
+    # 准备Gray->Edge预训练优化器
+    if args.optim == 'Adam':
+        # 分层学习率：输入层使用更高的学习率
+        optimizer = torch.optim.Adam([
+            {'params': [p for n, p in model.named_parameters() if 'input' in n], 'lr': args.lr * 10},
+            {'params': [p for n, p in model.named_parameters() if 'input' not in n], 'lr': args.lr}
+        ])
+        print(f"Gray->Edge预训练使用Adam优化器，输入层学习率: {args.lr * 10}, 其他层学习率: {args.lr}")
+    elif args.optim == 'SGD':
+        optimizer = torch.optim.SGD([
+            {'params': [p for n, p in model.named_parameters() if 'input' in n], 'lr': args.lr * 10,
+             'momentum': 0.9, 'weight_decay': args.weight_decay, 'nesterov': False},
+            {'params': [p for n, p in model.named_parameters() if 'input' not in n], 'lr': args.lr * 1,
+             'momentum': 0.9, 'weight_decay': args.weight_decay, 'nesterov': False}
+        ])
+        print(f"Gray->Edge预训练使用SGD优化器，输入层学习率: {args.lr * 10}, 其他层学习率: {args.lr}")
+    else:
+        raise Exception(f"优化器应为 ['SGD', 'Adam']，输入为 {args.optim}")
+
+    # Gray->Edge预训练学习率调度器
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.5)
+
+    print(f"\n模型参数总数: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"可训练参数: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    
+    print(f"\n迁移学习配置:")
+    print(f"  编码器迁移损失: {args.encoder_tl_lamb} × {args.encoder_tl_loss_type}")
+    print(f"  特征迁移损失: {args.feature_tl_lamb} × {args.feature_tl_loss_type}")
+    print(f"  编码器类型: {args.encoder_type}")
+    print(f"  边缘提取: Sobel + Canny双算法叠加")
+    print(f"  实验目的: 验证色彩信息的重要性")
+    print(f"  预期: 对比SDSTL，分析色彩信息的贡献")
+    
+    # Gray->Edge预训练 (使用AlignmentTLTrainer_Edge_1)
+    print("\n开始Gray->Edge预训练...")
+    trainer = AlignmentTLTrainer_Edge_1(
+        args, device, writer, model, optimizer, TET_loss, scheduler, 
+        os.path.join(model_path, "gray_edge_pretrained.pth")
+    )
+    
+    best_train_acc, best_train_loss = trainer.train(gray_train_loader)
+    
+    # Gray->Edge预训练测试
+    test_loss, test_acc1, test_acc5 = trainer.test(gray_test_loader)
+    print(f'\nGray->Edge预训练结果: test_loss={test_loss:.5f} test_acc1={test_acc1:.4f} test_acc5={test_acc5:.4f}')
+    
+    # 保存Gray->Edge预训练模型
+    pretrained_path = os.path.join(model_path, "gray_edge_pretrained_best.pth")
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'test_acc1': test_acc1,
+        'test_acc5': test_acc5,
+        'test_loss': test_loss,
+        'args': args
+    }, pretrained_path)
+    print(f"Gray->Edge预训练模型已保存到: {pretrained_path}")
+
+    # 记录测试结果到TensorBoard
+    writer.add_scalar(tag="final/gray_edge_accuracy", scalar_value=test_acc1, global_step=0)
+    writer.add_scalar(tag="final/gray_edge_loss", scalar_value=test_loss, global_step=0)
+
+    # 保存结果到文件
+    write_content = (
+        f'=== Caltech101 Gray->Edge预训练 结果 (消融实验2) ===\n'
+        f'种子: {args.seed}\n'
+        f'边缘提取器: Sobel + Canny双算法 (2通道输出)\n'
+        f'模型: {"VGGSNNwoAP" if args.use_woap else "VGGSNN"}\n'
+        f'预训练epochs: {args.epochs}, 学习率: {args.lr}\n'
+        f'编码器迁移损失: {args.encoder_tl_lamb} × {args.encoder_tl_loss_type}\n'
+        f'特征迁移损失: {args.feature_tl_lamb} × {args.feature_tl_loss_type}\n'
+        f'Gray样本比例: {args.Gray_sample_ratio}\n'
+        f'Gray通道扩展: 1通道 -> 3通道 (复制)\n'
+        f'Gray->Edge预训练准确率: {test_acc1:.4f}%\n'
+        f'预训练模型保存路径: {pretrained_path}\n'
+        f'实验目的: 验证色彩信息的重要性\n'
+        f'预期: 对比SDSTL，分析色彩贡献\n'
+        f'=====================================\n\n'
+    )
+    f.write(write_content)
+    f.close()
+    
+    writer.close()
+    print(f"\n预训练完成！模型已保存到: {pretrained_path}")
+    print(f"结果已记录到: Caltech101_{args.seed}_gray2edge_pretrain_result.txt")
+    print(f"\n使用预训练参数进行DVS微调:")
+    print(f"python train_caltech101_baseline.py --pretrained_path {pretrained_path}")
+

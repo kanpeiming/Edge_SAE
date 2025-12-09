@@ -7,7 +7,7 @@
 The code in this file is form Temporal Efficient Training of Spiking Neural Network via Gradient Re-weighting https://github.com/Gus-Lab/temporal_efficient_training
 """
 
-from models.TET__layer import *
+from ..TET__layer import *
 
 
 class VGGSNN(nn.Module):

@@ -12,7 +12,7 @@ from collections import Counter
 # 13行的导入有一些问题
 # _utils 856行,可能是torch2.4.1没有这种方法，因此在本文档中定义
 # from torch._utils import _accumulate
-from dataloader.dataloader_utils import *
+from .dataloader_utils import *
 from torch.utils.data.dataset import Subset
 from torchvision import datasets, transforms
 from spikingjelly.datasets import cifar10_dvs
@@ -61,10 +61,10 @@ def get_tl_cifar10(batch_size, train_set_ratio=1.0, dvs_train_set_ratio=1.0, val
         val_dataloader: 验证数据加载器（仅DVS数据，用于验证DVS分类性能）
         test_dataloader: 测试数据加载器（仅DVS数据）
     """
-    # 构建RGB训练变换序列 - 保持32×32
+    # 构建RGB训练变换序列 - 与tl.py保持一致使用32×32
     rgb_transforms = [
-        transforms.Resize(32),
-        transforms.RandomCrop(32, padding=4),
+        transforms.Resize(48),
+        transforms.RandomCrop(48, padding=4),
         transforms.RandomHorizontalFlip(),  # 随机水平翻转
     ]
     
@@ -83,9 +83,9 @@ def get_tl_cifar10(batch_size, train_set_ratio=1.0, dvs_train_set_ratio=1.0, val
         rgb_transforms.append(Cutout(n_holes=1, length=cutout_length))
         
     rgb_trans_train = transforms.Compose(rgb_transforms)
-    # DVS数据transform - 添加归一化以与RGB数据保持一致
+    # DVS数据transform - 与tl.py保持一致使用32×32
     dvs_trans = transforms.Compose([
-        transforms.Resize((32, 32)),
+        transforms.Resize((48, 48)),
         transforms.ToTensor(),
         # DVS数据通常是二值的，使用简单的归一化
         # transforms.Normalize((0.5, 0.5), (0.5, 0.5)),  # 将[0,1]映射到[-1,1]
@@ -338,7 +338,7 @@ class DVSCifar10v1(Dataset):
         self.transform = transform
         self.target_transform = target_transform
         self.train = train
-        self.resize = transforms.Resize(size=(32, 32))
+        self.resize = transforms.Resize(size=(48, 48))
         self.tensorx = transforms.ToTensor()
         self.imgx = transforms.ToPILImage()
 

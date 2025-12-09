@@ -5,3 +5,7 @@
 @file: __init__.py.py
 @time: 2022/4/19 11:10
 """
+
+from .rgb_only_trainer import RGBOnlyTrainer
+
+__all__ = ['RGBOnlyTrainer']

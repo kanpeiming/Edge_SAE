@@ -16,7 +16,7 @@ from models.TET__layer import *
 
 
 class VGGSNN(nn.Module):
-    def __init__(self, cls_num=10, img_shape=32, device='cuda'):
+    def __init__(self, cls_num=10, img_shape=48, device='cuda'):
         super(VGGSNN, self).__init__()
         pool = SeqToANNContainer(nn.AvgPool2d(2))
         self.rgb_input = Layer(3, 64, 3, 1, 1, True)
@@ -129,9 +129,12 @@ class VGGSNNwoAP(VGGSNN):
         
         Args:
             cls_num: 分类数量，默认10（CIFAR10）
-            img_shape: 输入图像大小，默认32（与tl.py保持一致使用32x32）
+            img_shape: 输入图像大小，默认32（与tl.py保持一致，CIFAR10使用32×32）
         
-        注意：与tl.py保持一致的bottleneck设计（LIFSpike独立）
+        注意：完全复制tl.py的bottleneck设计
+        - bottleneck包含Linear+LIFSpike
+        - bottleneck_lif_node继承自父类（会导致两次LIFSpike激活）
+        - 这与tl.py的实现完全一致
         """
         super(VGGSNNwoAP, self).__init__(cls_num=cls_num, img_shape=img_shape, device='cuda')
         self.rgb_input = Layer(3, 64, 3, 1, 1, True)  # 保持True以记录mem
@@ -146,9 +149,10 @@ class VGGSNNwoAP(VGGSNN):
             Layer(512, 512, 3, 2, 1, False),
         )
         W = int(img_shape / 2 / 2 / 2 / 2)
-        # 修复：与tl.py保持一致，LIFSpike作为独立层
-        self.bottleneck = SeqToANNContainer(nn.Linear(512 * W * W, 256))
-        self.bottleneck_lif_node = LIFSpike()
+        # 关键修复：与tl.py完全一致，LIFSpike放在SeqToANNContainer内部
+        # 注意：父类的bottleneck_lif_node仍然存在，会导致两次LIFSpike激活
+        self.bottleneck = SeqToANNContainer(nn.Linear(512 * W * W, 256),
+                                            LIFSpike())
         self.classifier = SeqToANNContainer(nn.Linear(256, cls_num))
 
         for m in self.modules():

@@ -2,7 +2,7 @@ import os
 import bisect
 from collections import Counter
 from spikingjelly.datasets import n_mnist
-from dataloader.dataloader_utils import *
+from .dataloader_utils import *
 from torchvision import datasets, transforms
 from typing import Any, Callable, Optional, Tuple
 from torch.utils.data import Dataset, random_split
