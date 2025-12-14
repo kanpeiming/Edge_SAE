@@ -4,6 +4,11 @@
 @contact: zhanqg@foxmail.com
 @file: dataloader_utils.py
 @time: 2022/4/19 11:27
+
+集成NDA_SNN的数据增强方法:
+- DVS数据增强: roll, rotate, shear (随机选择)
+- CutMix数据增强
+- Cutout数据增强
 """
 
 import torch
@@ -16,6 +21,7 @@ from prefetch_generator import BackgroundGenerator
 from collections.abc import Iterable
 import torchvision.transforms.functional as F
 from torchvision.transforms.transforms import ToPILImage, ToTensor
+import torchvision.transforms as transforms
 
 
 def split_to_train_test_set(train_ratio: float, origin_dataset: torch.utils.data.Dataset, num_classes: int,
@@ -370,3 +376,206 @@ class DVSResize(object):
     def __repr__(self):
         interpolate_str = self._pil_interpolation_to_str[self.interpolation]
         return self.__class__.__name__ + '(size={0}, interpolation={1})'.format(self.size, interpolate_str)
+
+
+# ============================================================================
+# NDA_SNN数据增强方法集成 (Neuromorphic Data Augmentation)
+# ============================================================================
+
+class DVSAugment(object):
+    """
+    DVS数据增强类 - 集成自NDA_SNN
+    随机选择roll、rotate或shear中的一种进行数据增强
+    默认包含水平翻转（概率0.5）
+    
+    Args:
+        roll_range (tuple): roll操作的范围，默认(-5, 5)
+        rotate_degrees (float): 旋转角度范围，默认15度
+        shear_range (tuple): shear操作的范围，默认(-15, 15)
+        apply_prob (float): 应用增强的概率，默认1.0
+        flip_prob (float): 水平翻转概率，默认0.5
+    """
+    
+    def __init__(self, roll_range=(-5, 5), rotate_degrees=15, shear_range=(-15, 15), 
+                 apply_prob=1.0, flip_prob=0.5):
+        self.roll_range = roll_range
+        self.rotate_degrees = rotate_degrees
+        self.shear_range = shear_range
+        self.apply_prob = apply_prob
+        self.flip_prob = flip_prob
+        
+        # 初始化transform
+        self.rotate_transform = transforms.RandomRotation(degrees=rotate_degrees)
+        self.shear_transform = transforms.RandomAffine(degrees=0, shear=shear_range)
+    
+    def __call__(self, dvs_data):
+        """
+        Args:
+            dvs_data (Tensor): DVS数据，形状为 (T, C, H, W)
+        
+        Returns:
+            Tensor: 增强后的DVS数据
+        """
+        # 水平翻转（概率0.5）
+        if random.random() < self.flip_prob:
+            dvs_data = torch.flip(dvs_data, dims=(3,))
+        
+        if random.random() > self.apply_prob:
+            return dvs_data
+        
+        # 随机选择一种增强方法
+        choices = ['roll', 'rotate', 'shear']
+        aug_method = np.random.choice(choices)
+        
+        if aug_method == 'roll':
+            # 随机平移
+            off1 = random.randint(self.roll_range[0], self.roll_range[1])
+            off2 = random.randint(self.roll_range[0], self.roll_range[1])
+            dvs_data = torch.roll(dvs_data, shifts=(off1, off2), dims=(2, 3))
+        
+        elif aug_method == 'rotate':
+            # 随机旋转
+            dvs_data = self.rotate_transform(dvs_data)
+        
+        elif aug_method == 'shear':
+            # 随机剪切
+            dvs_data = self.shear_transform(dvs_data)
+        
+        return dvs_data
+    
+    def __repr__(self):
+        return (f"{self.__class__.__name__}("
+                f"roll_range={self.roll_range}, "
+                f"rotate_degrees={self.rotate_degrees}, "
+                f"shear_range={self.shear_range}, "
+                f"apply_prob={self.apply_prob})")
+
+
+class DVSAugmentCaltech101(DVSAugment):
+    """
+    Caltech101专用的DVS数据增强 (使用较小的增强范围)
+    默认包含水平翻转（概率0.5）
+    """
+    def __init__(self, apply_prob=1.0, flip_prob=0.5):
+        super().__init__(
+            roll_range=(-3, 3),
+            rotate_degrees=15,
+            shear_range=(-15, 15),
+            apply_prob=apply_prob,
+            flip_prob=flip_prob
+        )
+
+
+class DVSAugmentCIFAR10(DVSAugment):
+    """
+    CIFAR10专用的DVS数据增强 (使用较大的增强范围)
+    默认包含水平翻转（概率0.5）
+    """
+    def __init__(self, apply_prob=1.0, flip_prob=0.5):
+        super().__init__(
+            roll_range=(-5, 5),
+            rotate_degrees=30,
+            shear_range=(-30, 30),
+            apply_prob=apply_prob,
+            flip_prob=flip_prob
+        )
+
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    """
+    Mixup损失函数
+    
+    Args:
+        criterion: 损失函数
+        pred: 预测结果
+        y_a: 第一个样本的标签
+        y_b: 第二个样本的标签
+        lam: mixup系数
+    
+    Returns:
+        混合后的损失
+    """
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+
+def rand_bbox(size, lam):
+    """
+    生成CutMix的随机边界框
+    
+    Args:
+        size: 输入数据的尺寸 (B, T, C, H, W)
+        lam: CutMix系数
+    
+    Returns:
+        边界框坐标 (bbx1, bby1, bbx2, bby2)
+    """
+    W = size[3]
+    H = size[4]
+    cut_rat = np.sqrt(1. - lam)
+    cut_w = int(W * cut_rat)
+    cut_h = int(H * cut_rat)
+
+    # 随机选择中心点
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+
+    bbx1 = np.clip(cx - cut_w // 2, 0, W)
+    bby1 = np.clip(cy - cut_h // 2, 0, H)
+    bbx2 = np.clip(cx + cut_w // 2, 0, W)
+    bby2 = np.clip(cy + cut_h // 2, 0, H)
+
+    return bbx1, bby1, bbx2, bby2
+
+
+def cutmix_data(input_data, target, alpha=1.0):
+    """
+    CutMix数据增强 - 集成自NDA_SNN
+    
+    Args:
+        input_data (Tensor): 输入数据，形状为 (B, T, C, H, W)
+        target (Tensor): 目标标签
+        alpha (float): Beta分布的参数
+    
+    Returns:
+        混合后的数据、标签a、标签b、混合系数
+    """
+    lam = np.random.beta(alpha, alpha)
+    rand_index = torch.randperm(input_data.size()[0]).cuda()
+
+    target_a = target
+    target_b = target[rand_index]
+
+    # 生成混合样本
+    bbx1, bby1, bbx2, bby2 = rand_bbox(input_data.size(), lam)
+    input_data[:, :, :, bbx1:bbx2, bby1:bby2] = input_data[rand_index, :, :, bbx1:bbx2, bby1:bby2]
+    
+    # 根据像素比例调整lambda
+    lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (input_data.size()[-1] * input_data.size()[-2]))
+    
+    return input_data, target_a, target_b, lam
+
+
+def mixup_data(input_data, target, alpha=1.0):
+    """
+    Mixup数据增强
+    
+    Args:
+        input_data (Tensor): 输入数据
+        target (Tensor): 目标标签
+        alpha (float): Beta分布的参数
+    
+    Returns:
+        混合后的数据、标签a、标签b、混合系数
+    """
+    lam = np.random.beta(alpha, alpha)
+    batch_size = input_data.size()[0]
+    
+    if input_data.is_cuda:
+        index = torch.randperm(batch_size).cuda()
+    else:
+        index = torch.randperm(batch_size)
+    
+    mixed_input = lam * input_data + (1 - lam) * input_data[index, :]
+    target_a, target_b = target, target[index]
+    
+    return mixed_input, target_a, target_b, lam

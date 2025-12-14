@@ -21,7 +21,10 @@ dataset_path/
 2. 使用默认数据路径训练:
    python train_caltech101_baseline.py --batch_size 32 --lr 0.001 --epoch 100
 
-3. 使用预训练模型:
+3. 使用NDA数据增强训练:
+   python train_caltech101_baseline.py --use_nda --batch_size 32 --lr 0.001 --epoch 100
+
+4. 使用预训练模型:
    python train_caltech101_baseline.py --pretrained_path /path/to/pretrained.pth --lr 0.0001
 
 参数说明:
@@ -29,8 +32,9 @@ dataset_path/
 - batch_size: 批次大小 (默认32)
 - lr: 学习率 (默认0.001)
 - T: SNN时间步数 (默认10)
-- size: 输入图像尺寸 (默认224)
+- size: 输入图像尺寸 (默认48)
 - dvs_sample_ratio: 训练集使用比例 (默认1.0)
+- use_nda: 是否使用NDA数据增强 (默认False，包含水平翻转0.5+roll/rotate/shear随机选择)
 
 特性:
 - 模块化数据加载器（位于dataloader.caltech101模块）
@@ -46,13 +50,13 @@ import argparse
 from tqdm import tqdm
 from tl_utils.common_utils import seed_all
 from tl_utils.trainer import Trainer
-from tl_utils.loss_function import TET_loss
+from tl_utils.loss_function import TET_loss, TRT_loss
 from dataloader.caltech101 import create_caltech101_dataloaders
 from models.snn_models.VGG import VGGSNN, VGGSNNwoAP
 from torch.utils.tensorboard import SummaryWriter
 
 parser = argparse.ArgumentParser(description='PyTorch Temporal Efficient Training for N-Caltech101')
-parser.add_argument('--batch_size', default=16, type=int, help='Batchsize')
+parser.add_argument('--batch_size', default=32, type=int, help='Batchsize')
 parser.add_argument('--lr', default=0.001, type=float, help='Learning rate')
 parser.add_argument('--weight_decay', default=5e-4, type=float, help='Weight decay')
 parser.add_argument('--epoch', default=100, type=int, help='Training epochs')
@@ -73,6 +77,21 @@ parser.add_argument('--size', type=int, default=48,
                     help='Input image size for N-Caltech101')
 parser.add_argument('--caltech101_dvs_path', type=str, default='/home/user/kpm/kpm/Dataset/Caltech101/n-caltech101',
                     help='Path to N-Caltech101 DVS dataset (if not provided, will use default path in dataloader)')
+# NDA (Neuromorphic Data Augmentation) 参数
+parser.add_argument('--use_nda', action='store_true', default=False,
+                    help='Whether to use NDA (Neuromorphic Data Augmentation) including flip(0.5) + roll/rotate/shear')
+# TRT (Temporal Regularization Training) 参数
+parser.add_argument('--use_trt', action='store_true', default=False,
+                    help='Whether to use TRT (Temporal Regularization Training) loss')
+parser.add_argument('--trt_decay', type=float, default=0.5,
+                    help='TRT decay factor δ (controls regularization decay over time, default: 0.5)')
+parser.add_argument('--trt_lambda', type=float, default=1e-5,
+                    help='TRT regularization coefficient λ (default: 1e-5)')
+parser.add_argument('--trt_epsilon', type=float, default=1e-5,
+                    help='TRT epsilon ε (safeguard value to prevent division by zero, default: 1e-5)')
+parser.add_argument('--trt_eta', type=float, default=0.05,
+                    help='TRT eta η (MSE loss weight, default: 0.05)')
+parser.add_argument('--fine_tuning', default= 'no', type = str, help='Fine-tuning or no')
 args = parser.parse_args()
 
 # 添加缺失的data_set属性（trainer需要用到）
@@ -82,7 +101,7 @@ args.data_set = 'Caltech101'
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 # 日志名称 加载预训练参数，改变一下命名为微调
-log_name = f"PretrainT4_Fine-tuning_NCaltech101_baseline_lr{args.lr}_T{args.T}_bs{args.batch_size}_seed{args.seed}"
+log_name = f"FT_{args.fine_tuning}_NCaltech101_baseline_lr{args.lr}_T{args.T}_bs{args.batch_size}_seed{args.seed}_nda{args.use_nda}_trt{args.use_trt}"
 
 # 创建日志和检查点目录
 os.makedirs(args.log_dir, exist_ok=True)
@@ -101,13 +120,18 @@ if __name__ == "__main__":
     # 准备数据
     print("Loading N-Caltech101 dataset...")
     print(f"Dataset path: {args.caltech101_dvs_path}")
+    print(f"Using NDA augmentation: {args.use_nda}")
+    if args.use_nda:
+        print("  - Horizontal flip: 50% probability")
+        print("  - Random augmentation: Roll/Rotate/Shear (one selected randomly)")
     
     train_loader, test_loader = create_caltech101_dataloaders(
         data_path=args.caltech101_dvs_path,
         batch_size=args.batch_size,
         train_ratio=args.dvs_sample_ratio,
         num_workers=8,
-        img_size=args.size
+        img_size=args.size,
+        use_nda=args.use_nda  # 传递NDA参数
     )
 
     # 准备模型 - N-Caltech101有101个类别
@@ -171,9 +195,29 @@ if __name__ == "__main__":
     print("Starting training...")
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    
+    # 选择损失函数：TRT或TET
+    if args.use_trt:
+        print(f"\n使用TRT (Temporal Regularization Training) Loss")
+        print(f"  - TRT decay (δ): {args.trt_decay}")
+        print(f"  - TRT lambda (λ): {args.trt_lambda}")
+        print(f"  - TRT epsilon (ε): {args.trt_epsilon}")
+        print(f"  - TRT eta (η): {args.trt_eta}")
+        # 创建TRT loss函数的wrapper
+        criterion = lambda outputs, labels: TRT_loss(
+            model, outputs, labels, 
+            criterion=torch.nn.CrossEntropyLoss(),
+            decay=args.trt_decay, 
+            lamb=args.trt_lambda, 
+            epsilon=args.trt_epsilon, 
+            eta=args.trt_eta
+        )
+    else:
+        print(f"\n使用TET (Temporal Efficient Training) Loss")
+        criterion = TET_loss
 
     # 训练
-    trainer = Trainer(args, device, writer, model, optimizer, TET_loss, scheduler, model_path)
+    trainer = Trainer(args, device, writer, model, optimizer, criterion, scheduler, model_path)
     trainer.train(train_loader, test_loader)
 
     # 测试

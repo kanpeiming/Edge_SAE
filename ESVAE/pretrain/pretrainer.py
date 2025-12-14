@@ -415,8 +415,8 @@ class AlignmentTLTrainer_Edge_1(TLTrainer):
                 target_data = data.to(self.device).float()  # 目标数据，先赋值为原始数据
 
                 # 对目标数据进行边缘提取
-                target_data1 = self.network.edge_extractor1(target_data)
-                target_data2 = self.network.edge_extractor2(target_data)
+                target_data1 = self.network.edge_extractor1(target_data)  # Sobel
+                target_data2 = self.network.edge_extractor1(target_data)  # Canny
                 # 将边缘提取的图通道变为2，方便后续对DVS的迁移，DVS是两通道，这样可以不修改模型
                 target_data = torch.cat((target_data1, target_data2), dim=1)
 

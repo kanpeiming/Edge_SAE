@@ -39,7 +39,7 @@ from dataloader.caltech101 import get_tl_caltech101
 from tl_utils.caltech101_trainer import AlignmentTLTrainerWithDVSWeight
 from pretrain.pretrainModel import VGGSNN, VGGSNNwoAP
 from tl_utils import common_utils
-from tl_utils.loss_function import TET_loss
+from tl_utils.loss_function import TET_loss, TRT_loss
 
 parser = argparse.ArgumentParser(description='Caltech101 RGB to DVS Transfer Learning')
 parser.add_argument('--data_set', type=str, default='Caltech101',
@@ -79,6 +79,17 @@ parser.add_argument('--dvs_sample_ratio', type=float, default=1.0,
                     help='Ratio of DVS training set to use')
 parser.add_argument('--use_grayscale', default=False, type=bool, 
                     help='Whether to convert RGB to grayscale (keep 3 channels) for structure-based transfer validation')
+# TRT (Temporal Regularization Training) 参数
+parser.add_argument('--use_trt', action='store_true', default=False,
+                    help='Whether to use TRT (Temporal Regularization Training) loss')
+parser.add_argument('--trt_decay', type=float, default=0.5,
+                    help='TRT decay factor δ (default: 0.5)')
+parser.add_argument('--trt_lambda', type=float, default=1e-5,
+                    help='TRT regularization coefficient λ (default: 1e-5)')
+parser.add_argument('--trt_epsilon', type=float, default=1e-5,
+                    help='TRT epsilon ε (default: 1e-5)')
+parser.add_argument('--trt_eta', type=float, default=0.05,
+                    help='TRT eta η (MSE loss weight, default: 0.05)')
 
 args = parser.parse_args()
 
@@ -170,8 +181,28 @@ if __name__ == "__main__":
     print(f"优化器: {args.optim}, 学习率: {args.lr}, Epoch: {args.epoch}")
     print(f"参数量: {sum(p.numel() for p in model.parameters()):,}\n")
     
+    # 选择损失函数：TRT或TET
+    if args.use_trt:
+        print(f"使用TRT (Temporal Regularization Training) Loss")
+        print(f"  - TRT decay (δ): {args.trt_decay}")
+        print(f"  - TRT lambda (λ): {args.trt_lambda}")
+        print(f"  - TRT epsilon (ε): {args.trt_epsilon}")
+        print(f"  - TRT eta (η): {args.trt_eta}\n")
+        # 创建TRT loss函数的wrapper
+        criterion = lambda outputs, labels: TRT_loss(
+            model, outputs, labels, 
+            criterion=torch.nn.CrossEntropyLoss(),
+            decay=args.trt_decay, 
+            lamb=args.trt_lambda, 
+            epsilon=args.trt_epsilon, 
+            eta=args.trt_eta
+        )
+    else:
+        print(f"使用TET (Temporal Efficient Training) Loss\n")
+        criterion = TET_loss
+    
     trainer = AlignmentTLTrainerWithDVSWeight(
-        args, device, writer, model, optimizer, TET_loss, scheduler, model_path
+        args, device, writer, model, optimizer, criterion, scheduler, model_path
     )
     
     print("开始训练...\n")

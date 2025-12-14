@@ -1,0 +1,150 @@
+================================================================================
+DVS事件数据可视化模块使用说明
+DVS Event Data Visualization Module Usage Guide
+================================================================================
+
+一、功能说明
+------------
+本模块用于可视化DVS事件相机数据，支持以下可视化:
+1. RGB图像
+2. RGB边缘图 (Sobel + Canny双边缘提取)
+3. DVS事件流3D点云 (Event Stream)
+4. DVS事件帧序列 (Event Frames)
+
+支持数据集: N-Caltech101, Caltech101
+
+
+二、快速使用
+------------
+1. 基础使用 (可视化第0个样本):
+   cd ESVAE
+   python visualization/dvs_visualizer.py
+   python dvs_visualizer.py --output_dir /home/user/kpm/kpm/visualization
+
+2. 指定样本索引:
+   python visualization/dvs_visualizer.py --sample_idx 10
+
+3. 指定输出目录:
+   python visualization/dvs_visualizer.py --sample_idx 5 --output_dir my_vis_results
+
+4. 使用CPU:
+   python visualization/dvs_visualizer.py --device cpu
+
+
+三、命令行参数
+--------------
+--dataset       数据集名称 (默认: caltech101)
+--sample_idx    样本索引 (默认: 0)
+--output_dir    输出目录 (默认: visualization_output)
+--device        设备 (默认: cuda)
+
+
+四、输出文件
+------------
+运行后会在输出目录生成以下文件:
+- sample_X_rgb.png              RGB原始图像
+- sample_X_edge.png             RGB边缘图 (Sobel/Canny/Merged)
+- sample_X_event_stream_3d.png  DVS事件流3D点云
+- sample_X_event_frames.png     DVS事件帧序列 (F1, F中, F最后)
+
+
+五、在代码中使用
+----------------
+from visualization import DVSVisualizer
+
+# 创建可视化器
+visualizer = DVSVisualizer(device='cuda')
+
+# 完整可视化一个样本
+visualizer.visualize_complete_sample(
+    dataset_name='caltech101',
+    sample_idx=0,
+    output_dir='my_output'
+)
+
+# 或者分别可视化各个部分
+rgb_img, dvs_data, label = visualizer.load_sample('caltech101', 0)
+edge_img = visualizer.extract_edge(rgb_img)
+
+visualizer.visualize_rgb_image(rgb_img, 'rgb.png')
+visualizer.visualize_edge_image(edge_img, 'edge.png')
+visualizer.visualize_event_stream_3d(dvs_data, 'stream.png')
+visualizer.visualize_event_frames(dvs_data, [0, 4, 9], 'frames.png')
+
+
+六、可视化说明
+--------------
+1. Event Stream 3D:
+   - 蓝色点: 正极性事件 (亮度增加)
+   - 绿色点: 负极性事件 (亮度减少)
+   - X轴: 图像宽度
+   - Y轴: 图像高度
+   - Z轴: 时间步
+
+2. Event Frames:
+   - 显示3个关键帧: F1 (第1帧), Fj (中间帧), F10 (最后帧)
+   - 蓝色: 正极性
+   - 绿色: 负极性
+
+3. RGB Edge:
+   - Sobel Edge: Sobel算子提取的边缘
+   - Canny Edge: Canny算子提取的边缘
+   - Merged Edge: 2通道合并 (蓝=Sobel, 绿=Canny)
+
+
+七、依赖项
+----------
+- torch
+- numpy
+- matplotlib
+- PIL
+- torchvision
+
+
+八、注意事项
+------------
+1. 确保数据集路径正确 (在dataloader/caltech101.py中配置DIR)
+2. 首次运行需要加载数据集，可能需要一些时间
+3. 3D点云可视化对于事件密集的样本可能较慢
+4. 输出图像为高分辨率 (300 DPI)
+
+
+九、示例输出
+------------
+运行 python visualization/dvs_visualizer.py --sample_idx 0
+
+输出:
+Loading sample 0 from caltech101...
+Label: 5
+RGB shape: torch.Size([3, 48, 48])
+DVS shape: torch.Size([10, 2, 48, 48])
+Extracting edges...
+Visualizing RGB image...
+RGB image saved to: visualization_output/sample_0_rgb.png
+Visualizing edge image...
+Edge image saved to: visualization_output/sample_0_edge.png
+Visualizing DVS event stream (3D)...
+Event stream 3D saved to: visualization_output/sample_0_event_stream_3d.png
+Visualizing DVS event frames...
+Event frames saved to: visualization_output/sample_0_event_frames.png
+
+Visualization complete! Results saved to: visualization_output/
+
+
+十、故障排除
+------------
+Q1: 找不到数据集?
+A1: 检查 dataloader/caltech101.py 中的 DIR 配置
+
+Q2: CUDA out of memory?
+A2: 使用 --device cpu 参数
+
+Q3: 可视化结果为空?
+A3: 检查样本索引是否有效，尝试其他样本
+
+Q4: 图像显示异常?
+A4: 确保数据格式正确 (T, C, H, W)
+
+
+================================================================================
+

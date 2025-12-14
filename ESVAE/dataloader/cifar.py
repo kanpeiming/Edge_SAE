@@ -8,11 +8,17 @@
 
 import os
 import bisect
+import random
+import torch
+import numpy as np
 from collections import Counter
 # 13行的导入有一些问题
 # _utils 856行,可能是torch2.4.1没有这种方法，因此在本文档中定义
 # from torch._utils import _accumulate
-from .dataloader_utils import *
+from .dataloader_utils import (
+    DataLoaderX, Cutout, CIFAR10Policy, RGBToGrayscale3Channel,
+    DVSResize, DVSAugment, DVSAugmentCIFAR10, split_to_train_test_set
+)
 from torch.utils.data.dataset import Subset
 from torchvision import datasets, transforms
 from spikingjelly.datasets import cifar10_dvs
@@ -169,8 +175,8 @@ def get_cifar10(batch_size, train_set_ratio=1.0):
     get the train loader and test loader of cifar10.
     :return: train_loader, test_loader
     """
-    trans_train = transforms.Compose([transforms.Resize(32),
-                                      transforms.RandomCrop(32, padding=4),
+    trans_train = transforms.Compose([transforms.Resize(48),
+                                      transforms.RandomCrop(48, padding=4),
                                       transforms.RandomHorizontalFlip(),  # 随机水平翻转
                                       # CIFAR10Policy(),  # AutoAugment策略 - 已注释以避免影响实验效果
                                       transforms.ToTensor(),
@@ -179,7 +185,7 @@ def get_cifar10(batch_size, train_set_ratio=1.0):
                                       # transforms.Normalize((0., 0., 0.), (1, 1, 1)),
                                       # Cutout(n_holes=1, length=16)  # 随机挖n_holes个length * length的洞
                                       ])
-    trans_test = transforms.Compose([transforms.Resize(32),
+    trans_test = transforms.Compose([transforms.Resize(48),
                                      transforms.ToTensor(),
                                      transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))])
 
@@ -333,11 +339,22 @@ class DVSCifar10(Dataset):
 
 
 class DVSCifar10v1(Dataset):
-    def __init__(self, root, train=True, transform=True, target_transform=None):
+    def __init__(self, root, train=True, transform=True, target_transform=None, use_nda=False):
+        """
+        DVS CIFAR10数据集
+        
+        Args:
+            root: 数据根目录
+            train: 是否为训练集
+            transform: 是否使用数据增强 (传统方法: flip + roll)
+            target_transform: 目标变换
+            use_nda: 是否使用NDA_SNN的数据增强方法 (roll/rotate/shear随机选择)
+        """
         self.root = os.path.expanduser(root)
         self.transform = transform
         self.target_transform = target_transform
         self.train = train
+        self.use_nda = use_nda
         self.resize = transforms.Resize(size=(48, 48))
         self.tensorx = transforms.ToTensor()
         self.imgx = transforms.ToPILImage()
@@ -346,6 +363,10 @@ class DVSCifar10v1(Dataset):
         self.samples = []
         self.class_to_idx = {}
         self._build_index()
+        
+        # 初始化NDA增强器
+        if self.use_nda:
+            self.nda_augment = DVSAugmentCIFAR10(apply_prob=1.0)
 
     def _build_index(self):
         class_dirs = sorted(os.listdir(self.root))
@@ -372,12 +393,17 @@ class DVSCifar10v1(Dataset):
         data = torch.stack(new_data, dim=0)
 
         if self.transform:
-            flip = random.random() > 0.5
-            if flip:
-                data = torch.flip(data, dims=(3,))
-            off1 = random.randint(-5, 5)
-            off2 = random.randint(-5, 5)
-            data = torch.roll(data, shifts=(off1, off2), dims=(2, 3))
+            if self.use_nda:
+                # 使用NDA_SNN的增强方法 (roll/rotate/shear随机选择)
+                data = self.nda_augment(data)
+            else:
+                # 使用传统增强方法 (flip + roll)
+                flip = random.random() > 0.5
+                if flip:
+                    data = torch.flip(data, dims=(3,))
+                off1 = random.randint(-5, 5)
+                off2 = random.randint(-5, 5)
+                data = torch.roll(data, shifts=(off1, off2), dims=(2, 3))
 
         if self.target_transform is not None:
             target = self.target_transform(target)

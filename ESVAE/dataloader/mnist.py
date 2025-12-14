@@ -2,7 +2,9 @@ import os
 import bisect
 from collections import Counter
 from spikingjelly.datasets import n_mnist
-from .dataloader_utils import *
+from .dataloader_utils import (
+    DataLoaderX, DVSResize, DVSAugment, split_to_train_test_set
+)
 from torchvision import datasets, transforms
 from typing import Any, Callable, Optional, Tuple
 from torch.utils.data import Dataset, random_split
@@ -198,11 +200,22 @@ class NMNIST(Dataset):
 
 
 class NMNIST1(Dataset):
-    def __init__(self, root, train=True, transform=True, target_transform=None):
+    def __init__(self, root, train=True, transform=True, target_transform=None, use_nda=False):
+        """
+        N-MNIST数据集
+        
+        Args:
+            root: 数据根目录
+            train: 是否为训练集
+            transform: 是否使用数据增强
+            target_transform: 目标变换
+            use_nda: 是否使用NDA_SNN的数据增强方法
+        """
         self.root = os.path.expanduser(root)
         self.transform = transform
         self.target_transform = target_transform
         self.train = train
+        self.use_nda = use_nda
         self.resize = transforms.Resize(size=(32, 32))
         self.tensorx = transforms.ToTensor()
         self.imgx = transforms.ToPILImage()
@@ -212,6 +225,16 @@ class NMNIST1(Dataset):
         self.class_to_idx = {}
         self._build_index()
         print(f"Found {len(self.samples)} samples in {root}")
+        
+        # 初始化NDA增强器 (MNIST使用较小的增强范围，包含水平翻转)
+        if self.use_nda:
+            self.nda_augment = DVSAugment(
+                roll_range=(-3, 3),
+                rotate_degrees=10,
+                shear_range=(-10, 10),
+                apply_prob=1.0,
+                flip_prob=0.5  # 50%概率水平翻转
+            )
 
     def _build_index(self):
         class_dirs = sorted(os.listdir(self.root))
@@ -240,12 +263,17 @@ class NMNIST1(Dataset):
             data = torch.stack(new_data, dim=0)
 
             if self.transform:
-                flip = random.random() > 0.5
-                if flip:
-                    data = torch.flip(data, dims=(3,))
-                off1 = random.randint(-5, 5)
-                off2 = random.randint(-5, 5)
-                data = torch.roll(data, shifts=(off1, off2), dims=(2, 3))
+                if self.use_nda:
+                    # 使用NDA_SNN的增强方法
+                    data = self.nda_augment(data)
+                else:
+                    # 使用传统增强方法
+                    flip = random.random() > 0.5
+                    if flip:
+                        data = torch.flip(data, dims=(3,))
+                    off1 = random.randint(-5, 5)
+                    off2 = random.randint(-5, 5)
+                    data = torch.roll(data, shifts=(off1, off2), dims=(2, 3))
 
             if self.target_transform is not None:
                 label = self.target_transform(label)

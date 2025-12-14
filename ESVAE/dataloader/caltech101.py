@@ -3,7 +3,9 @@ import bisect
 import torch
 import random
 from collections import Counter
-from .dataloader_utils import *
+from .dataloader_utils import (
+    DataLoaderX, DVSResize, DVSAugment, DVSAugmentCaltech101, split_to_train_test_set
+)
 from torchvision import datasets, transforms
 from spikingjelly.datasets import n_caltech101
 from torch.utils.data import Dataset, random_split
@@ -708,10 +710,18 @@ class NCaltech101Dataset(Dataset):
     优化的N-Caltech101数据集类
     支持灵活的文件命名格式和数据增强
     """
-    def __init__(self, root, transform=True, img_size=224):
+    def __init__(self, root, transform=True, img_size=224, use_nda=False):
+        """
+        Args:
+            root: 数据根目录
+            transform: 是否使用数据增强
+            img_size: 图像尺寸
+            use_nda: 是否使用NDA_SNN的数据增强方法
+        """
         self.root = os.path.expanduser(root)
         self.transform = transform
         self.img_size = img_size
+        self.use_nda = use_nda
         self.resize = transforms.Resize(size=(img_size, img_size))
         self.to_tensor = transforms.ToTensor()
         self.to_pil = transforms.ToPILImage()
@@ -719,6 +729,10 @@ class NCaltech101Dataset(Dataset):
         # 构建文件列表并排序
         self.files = self._build_file_list()
         print(f"Loaded {len(self.files)} samples from {root}")
+        
+        # 初始化NDA增强器
+        if self.use_nda:
+            self.nda_augment = DVSAugmentCaltech101(apply_prob=1.0)
 
     def _build_file_list(self):
         """构建并排序文件列表"""
@@ -835,11 +849,16 @@ class NCaltech101Dataset(Dataset):
         
         # 数据增强
         if self.transform:
-            if random.random() > 0.5:  # 随机水平翻转
-                data = torch.flip(data, dims=(3,))
-            # 随机平移
-            off_x, off_y = random.randint(-5, 5), random.randint(-5, 5)
-            data = torch.roll(data, shifts=(off_x, off_y), dims=(2, 3))
+            if self.use_nda:
+                # 使用NDA_SNN的增强方法
+                data = self.nda_augment(data)
+            else:
+                # 使用传统增强方法
+                if random.random() > 0.5:  # 随机水平翻转
+                    data = torch.flip(data, dims=(3,))
+                # 随机平移
+                off_x, off_y = random.randint(-5, 5), random.randint(-5, 5)
+                data = torch.roll(data, shifts=(off_x, off_y), dims=(2, 3))
         
         return data, target.long().squeeze(-1)
 
@@ -847,7 +866,7 @@ class NCaltech101Dataset(Dataset):
         return len(self.files)
 
 
-def create_caltech101_dataloaders(data_path, batch_size, train_ratio=1.0, num_workers=8, img_size=224):
+def create_caltech101_dataloaders(data_path, batch_size, train_ratio=1.0, num_workers=8, img_size=224, use_nda=False):
     """
     创建N-Caltech101数据加载器
     
@@ -857,6 +876,7 @@ def create_caltech101_dataloaders(data_path, batch_size, train_ratio=1.0, num_wo
         train_ratio: 训练集使用比例
         num_workers: 数据加载线程数
         img_size: 图像尺寸
+        use_nda: 是否使用NDA_SNN的数据增强方法
     
     Returns:
         train_loader, test_loader
@@ -872,8 +892,8 @@ def create_caltech101_dataloaders(data_path, batch_size, train_ratio=1.0, num_wo
         raise FileNotFoundError(f"train/test directories not found in {data_path}")
     
     # 创建数据集
-    train_dataset = NCaltech101Dataset(train_path, transform=True, img_size=img_size)
-    test_dataset = NCaltech101Dataset(test_path, transform=False, img_size=img_size)
+    train_dataset = NCaltech101Dataset(train_path, transform=True, img_size=img_size, use_nda=use_nda)
+    test_dataset = NCaltech101Dataset(test_path, transform=False, img_size=img_size, use_nda=False)
     
     print(f"Dataset loaded: {len(train_dataset)} train, {len(test_dataset)} test samples")
     

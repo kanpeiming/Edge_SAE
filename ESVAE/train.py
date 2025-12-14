@@ -18,8 +18,9 @@ import dataloader.cifar
 from dataloader.mnist import *
 from pretrain.pretrainer import *
 from pretrain.pretrainModel import *
+from pretrain.Edge import SobelEdgeExtractionModule, CannyEdgeDetectionModule
 from tl_utils import common_utils
-from tl_utils.loss_function import TET_loss
+from tl_utils.loss_function import TET_loss, TRT_loss
 
 parser = argparse.ArgumentParser(description='PyTorch Temporal Efficient Training')
 parser.add_argument('--data_set', type=str, default='CIFAR10',
@@ -31,7 +32,7 @@ parser.add_argument('--optim', default='Adam', type=str, choices=['SGD', 'Adam']
 parser.add_argument('--lr', default=0.001, type=float,
                     help='Learning rate')  # CIFAR10: 0.0002, Caltech101: 0.0002, MNIST: 0.0001
 parser.add_argument('--weight_decay', default=5e-4, type=float, help='Weight decay')
-parser.add_argument('--epochs', default=100, type=int, help='Training epochs')
+parser.add_argument('--epochs', default=30, type=int, help='Training epochs')
 # parser.add_argument('--id', default='test', type=str, help='Model identifier')
 parser.add_argument('--device', default='cuda', type=str, help='cuda or cpu')
 parser.add_argument('--parallel', default=False, type=bool, help='Whether to use multi-GPU parallelism')
@@ -59,6 +60,18 @@ parser.add_argument('--checkpoint', type=str, default='/home/user/kpm/kpm/result
                     help='the path of checkpoint dir.')
 parser.add_argument('--GPU_id', type=int, default=0, help='the id of used GPU.')
 parser.add_argument('--num_classes', type=int, default=10, help='the number of data classes.')
+# TRT (Temporal Regularization Training) 参数
+parser.add_argument('--use_trt', action='store_true', default=False,
+                    help='Whether to use TRT (Temporal Regularization Training) loss')
+parser.add_argument('--trt_decay', type=float, default=0.5,
+                    help='TRT decay factor δ (default: 0.5)')
+parser.add_argument('--trt_lambda', type=float, default=1e-5,
+                    help='TRT regularization coefficient λ (default: 1e-5)')
+parser.add_argument('--trt_epsilon', type=float, default=1e-5,
+                    help='TRT epsilon ε (default: 1e-5)')
+parser.add_argument('--trt_eta', type=float, default=0.05,
+                    help='TRT eta η (MSE loss weight, default: 0.05)')
+parser.add_argument('--edge_method', type=str, default='SobelAndCanny',help = 'how to use edge method.')
 
 args = parser.parse_args()
 
@@ -72,7 +85,8 @@ log_name = (
     f"lr{args.lr}_"
     f"T{args.T}_"
     f"seed{args.seed}_"
-    f"2Edge"  # 加上这个标记，表示使用了两个 edge_extractor
+    f"TwoChannelBase{args.edge_method}_"
+    f"woAP"
 )
 
 # 对应的路径设置
@@ -146,7 +160,11 @@ if __name__ == "__main__":
     #     print("测试集DVS数量", dvs_test_loader_list[0].get_len()[1] * len(dvs_test_loader_list))
 
     # preparing model  选择模型
-    model = VGGSNN(cls_num=10, img_shape=32, device='cuda')
+    model = VGGSNNwoAP(cls_num=10, img_shape=48)  # RGB CIFAR10是32x32
+
+    # 为模型添加边缘提取器（用于RGB->Edge训练）
+    model.edge_extractor1 = SobelEdgeExtractionModule(device=device, in_channels=3)
+    model.edge_extractor2 = CannyEdgeDetectionModule(device=device, in_channels=3)
 
     if args.parallel:
         model = torch.nn.DataParallel(model)
@@ -189,44 +207,48 @@ if __name__ == "__main__":
             f"The value of data_set should in ['CIFAR10', 'CINIC10_WO_CIFAR10', 'Caltech101', 'MNIST', 'ImageNet100'], "
             f"and your input is {args.data_set}")
 
+    # 选择损失函数：TRT或TET
+    if args.use_trt:
+        print(f"\n使用TRT (Temporal Regularization Training) Loss")
+        print(f"  - TRT decay (δ): {args.trt_decay}")
+        print(f"  - TRT lambda (λ): {args.trt_lambda}")
+        print(f"  - TRT epsilon (ε): {args.trt_epsilon}")
+        print(f"  - TRT eta (η): {args.trt_eta}")
+        # 创建TRT loss函数的wrapper
+        criterion = lambda outputs, labels: TRT_loss(
+            model, outputs, labels, 
+            criterion=torch.nn.CrossEntropyLoss(),
+            decay=args.trt_decay, 
+            lamb=args.trt_lambda, 
+            epsilon=args.trt_epsilon, 
+            eta=args.trt_eta
+        )
+    else:
+        print(f"\n使用TET (Temporal Efficient Training) Loss")
+        criterion = TET_loss
+
     # 训练（使用修改后的训练器）
-    trainer = AlignmentTLTrainer_Edge_1(args, device, writer, model, optimizer, TET_loss, scheduler, model_path)
+    trainer = AlignmentTLTrainer_Edge_1(args, device, writer, model, optimizer, criterion, scheduler, model_path)
 
-    if args.data_set == 'ImageNet100':
-        best_train_acc, best_train_loss = trainer.train(train_loader)
-        # test using a list of test loaders
-        test_loss, test_acc1, test_acc5 = trainer.test(dvs_test_loader_list)
-    else:
-        best_train_acc, best_train_loss = trainer.train(train_loader)
-        # test using a single test loader
-        test_loss, test_acc1, test_acc5 = trainer.test(dvs_test_loader)
+    # RGB->Edge预训练：只需要训练，不需要测试
+    best_train_acc, best_train_loss = trainer.train(train_loader)
+    
+    # 预训练阶段不进行测试，直接保存最佳模型
+    print(f"\n预训练完成！")
+    print(f"最佳训练准确率: {best_train_acc:.3f}")
+    print(f"最佳训练损失: {best_train_loss:.5f}")
+    
+    # 如果需要测试，请使用专门的测试脚本
+    # if args.data_set == 'ImageNet100':
+    #     test_loss, test_acc1, test_acc5 = trainer.test(dvs_test_loader_list)
+    # else:
+    #     test_loss, test_acc1, test_acc5 = trainer.test(dvs_test_loader)
 
-    if type(test_loss) is list:
-        all_test_loss = test_loss
-        test_loss = sum(test_loss) / len(test_loss)
-        all_test_acc1 = test_acc1
-        test_acc1 = sum(test_acc1) / len(test_acc1)
-        all_test_acc5 = test_acc5
-        test_acc5 = sum(test_acc5) / len(test_acc5)
-        print(f'test_loss={test_loss:.5f} test_acc1={test_acc1:.3f} test_acc5={test_acc5:.4f}')
-        writer.add_scalar(tag="test/accuracy1", scalar_value=test_acc1, global_step=0)
-        writer.add_scalar(tag="test/accuracy5", scalar_value=test_acc5, global_step=0)
-        writer.add_scalar(tag="test/loss", scalar_value=test_loss, global_step=0)
-        for test_id in range(len(all_test_loss)):
-            writer.add_scalar(tag=f"test{test_id + 1}/accuracy1", scalar_value=all_test_acc1[test_id], global_step=0)
-            writer.add_scalar(tag=f"test{test_id + 1}/accuracy5", scalar_value=all_test_acc5[test_id], global_step=0)
-            writer.add_scalar(tag=f"test{test_id + 1}/loss", scalar_value=all_test_loss[test_id], global_step=0)
-    else:
-        print(f'test_loss={test_loss:.5f} test_acc1={test_acc1:.3f} test_acc5={test_acc5:.4f}')
-        writer.add_scalar(tag="test/accuracy1", scalar_value=test_acc1, global_step=0)
-        writer.add_scalar(tag="test/accuracy5", scalar_value=test_acc5, global_step=0)
-        writer.add_scalar(tag="test/loss", scalar_value=test_loss, global_step=0)
-
+    # 保存训练结果
     write_content = (
         f'seed: {args.seed} \n'
-        f'encoder_tl_loss: {args.encoder_tl_lamb} * {args.encoder_tl_loss_type} \n'
-        f'feature_tl_loss: {args.feature_tl_lamb} * {args.feature_tl_loss_type} \n'
-        f'best_train_acc: {best_train_acc}, best_train_loss: {best_train_loss} \n\n'
+        f'RGB->Edge预训练 \n'
+        f'best_train_acc: {best_train_acc:.3f}, best_train_loss: {best_train_loss:.5f} \n\n'
     )
     f.write(write_content)
     f.close()

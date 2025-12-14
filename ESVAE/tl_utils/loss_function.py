@@ -390,3 +390,67 @@ def temporal_MSE(gram_x, gram_y):
     for t in range(gram_x.shape[1]):
         loss += MSE(gram_x[:, t, :], gram_y[:, t, :])
     return loss / gram_x.shape[1]
+
+
+def TRT_loss(model, outputs, labels, criterion=nn.CrossEntropyLoss(), 
+             decay=0.5, lamb=1e-5, epsilon=1e-5, eta=0.05):
+    """
+    Temporal Regularization Training (TRT) loss function.
+    
+    TRT机制：在每个时间步t添加正则化项r(t)，正则化强度随时间指数衰减。
+    
+    数学公式：
+    r(t) = Σ_{i=1}^{L-1} [λ / (1 + (|W| + ε)(e^{δ(t-1)} - 1))] · W²
+    
+    L_TRT = (1/T) Σ_t [(1-η)L_CE(O(t), y) + η·L_MSE(O(t), ŷ) + r(t)]
+    
+    Args:
+        model: SNN模型，用于获取所有层的权重参数
+        outputs: 模型输出，shape为(batch_size, T, num_classes)
+        labels: 真实标签，shape为(batch_size,)
+        criterion: 分类损失函数（默认交叉熵）
+        decay: 时间衰减因子δ，控制正则化随时间的衰减速度（默认0.5）
+        lamb: 正则化系数λ（默认1e-5）
+        epsilon: 安全值ε，防止除零（默认1e-5）
+        eta: MSE损失权重η，控制MSE损失的比例（默认0.05）
+    
+    Returns:
+        TRT总损失
+    """
+    from math import exp
+    
+    T = outputs.size(1)
+    total_loss = 0
+    mse_loss_fn = torch.nn.MSELoss()
+    
+    # 将标签转换为one-hot编码（用于MSE损失）
+    labels_one_hot = F.one_hot(labels, outputs.size(-1)).float()
+    
+    for t in range(T):
+        # 1. 分类损失 (CE Loss)
+        ce_loss = criterion(outputs[:, t, ...].float(), labels)
+        
+        # 2. MSE损失（辅助监督）
+        if eta != 0:
+            mse_loss = mse_loss_fn(outputs[:, t, ...].float(), labels_one_hot)
+        else:
+            mse_loss = 0
+        
+        # 3. 时间正则化项 r(t)
+        # r(t) = Σ [λ / (1 + (|W| + ε)(e^{δ(t-1)} - 1))] · W²
+        reg = 0
+        for name, param in model.named_parameters():
+            # 只对权重参数进行正则化，跳过偏置
+            if 'bias' not in name and param.requires_grad:
+                # 计算衰减因子：1 / (1 + (|W| + ε)(e^{δ(t-1)} - 1))
+                decay_factor = lamb / (1 + (torch.abs(param) + epsilon) * (exp(decay * t) - 1))
+                # 正则化项：decay_factor * W²
+                reg += torch.sum(param ** 2 * decay_factor)
+        
+        # 4. 合并损失：(1-η)L_CE + η·L_MSE + r(t)
+        total_loss += (1 - eta) * ce_loss + eta * mse_loss + reg
+    
+    # 5. 对所有时间步取平均
+    total_loss = total_loss / T
+    
+    return total_loss

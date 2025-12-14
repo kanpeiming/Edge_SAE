@@ -7,9 +7,23 @@
 """
 
 from .cifar import *
+from .mnist import *
+from .caltech101 import *
+from .dataloader_utils import (
+    DVSAugment,
+    DVSAugmentCaltech101,
+    DVSAugmentCIFAR10,
+    Cutout,
+    cutmix_data,
+    mixup_data,
+    mixup_criterion,
+    CIFAR10Policy,
+    ImageNetPolicy,
+    RGBToGrayscale3Channel,
+    DataLoaderX
+)
+
 # from .cinic import get_tl_cinic10_wo_cifar10
-# from .caltech101 import *
 # from .imagenet2caltech import *
-# from .mnist import *
 # from .imagenet import *
 # from .Office31 import get_small_office31

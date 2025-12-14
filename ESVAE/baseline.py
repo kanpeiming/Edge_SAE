@@ -52,7 +52,7 @@ args = parser.parse_args()
 device = torch.device("cuda:0")
 
 # log_name = f"Temporal_Efficient_Training_with_{args.dvs_sample_ratio}_dvs_data"
-log_name = f"addBN_baseline_CIFAR10_TET_{args.data_set}-data_set_{args.seed}-seed_{args.dvs_sample_ratio}-dvs_data_{args.dvs_encoding_type}-dvs_encoder_{args.lr}-lr_VGGSNN"
+log_name = f"woAP_SDSTL_CIFAR10_TET_{args.data_set}-data_set_{args.seed}-seed_{args.dvs_sample_ratio}-dvs_data_{args.dvs_encoding_type}-dvs_encoder_{args.lr}-lr_VGGSNN"
 
 writer = SummaryWriter(log_dir=os.path.join(args.log_dir + '_' + args.data_set, log_name))
 print(log_name)
@@ -82,45 +82,52 @@ if __name__ == "__main__":
     print("测试集DVS数量", len(test_loader) * args.batch_size)
 
     # preparing model
-    model = VGGSNN(2, 10, 32)  # Caltech101: (2, 101, 224); MNIST、Cifar10: (2, 10, 48)
+    # 根据数据集选择正确的图像尺寸
+    if args.data_set == 'CIFAR10':
+        img_shape = 48  # CIFAR10-DVS使用48x48（更大的特征图，保留更多细节）
+        cls_num = 10
+    elif args.data_set == 'MNIST':
+        img_shape = 34  # N-MNIST使用34x34
+        cls_num = 10
+    elif args.data_set == 'Caltech101':
+        img_shape = 224  # N-Caltech101使用224x224
+        cls_num = 101
+    else:
+        raise ValueError(f"Unsupported dataset: {args.data_set}")
+    
+    model = VGGSNNwoAP(cls_num=cls_num, img_shape=img_shape)
     if args.parallel:
         model = torch.nn.DataParallel(model)
     model.to(device)
 
-    # 加载预训练模型参数
-    if args.pretrained_path is not None:
-        checkpoint = torch.load(args.pretrained_path, weights_only=True)
-        pretrained_dict = checkpoint['model_state_dict']  # 获取模型参数字典
-        model_dict = model.state_dict()
-
-        # 打印模型结构信息
-        # print("Current model keys:", model_dict.keys())
-        # print("Pretrained model keys:", pretrained_dict.keys())
-
-        # 筛选出dvs_input和features层的参数
-        pretrained_dict = {k: v for k, v in pretrained_dict.items()
-                           if k in model_dict and ('dvs_input' in k or 'features' in k)}
-
-        if not pretrained_dict:
-            # print("Warning: No matching parameters found! This might be because:")
-            # print("1. The layer names are different between the two models")
-            # print("2. The model structure is different")
-            # print("3. The pretrained model file might not contain the expected layers")
-            #
-            # # 打印更详细的调试信息
-            # print("\nDetailed Debug Info:")
-            # print("Looking for layers containing 'dvs_input' or 'features' in:")
-            # pretrained_layers = [k for k in pretrained_dict.keys() if 'dvs_input' in k or 'features' in k]
-            # print("Pretrained model matching layers:", pretrained_layers)
-            # print("\nCurrent model layers that should match:")
-            current_layers = [k for k in model_dict.keys() if 'dvs_input' in k or 'features' in k]
-            # print("Current model matching layers:", current_layers)
+    # 加载预训练模型参数（train.py预训练的VGGSNNwoAP模型）
+    if args.pretrained_path is not None and os.path.exists(args.pretrained_path):
+        print(f"正在加载预训练模型参数: {args.pretrained_path}")
+        checkpoint = torch.load(args.pretrained_path, map_location=device)
+        
+        # 检查checkpoint的键
+        if 'model_state_dict' in checkpoint:
+            pretrained_dict = checkpoint['model_state_dict']
+            print(f"加载epoch {checkpoint.get('epoch', 'unknown')}的预训练模型")
         else:
-            # 更新当前模型的参数
-            model_dict.update(pretrained_dict)
-            model.load_state_dict(model_dict)
-            # print(f"Successfully loaded pretrained parameters from {args.pretrained_path}")
-            # print(f"Loaded layers: {list(pretrained_dict.keys())}")
+            pretrained_dict = checkpoint
+        
+        # 获取当前模型的state_dict
+        model_dict = model.state_dict()
+        
+        # 过滤掉不匹配的键（如edge_extractor）
+        pretrained_dict = {k: v for k, v in pretrained_dict.items() 
+                          if k in model_dict and v.shape == model_dict[k].shape 
+                          and 'edge_extractor' not in k}
+        
+        # 更新模型参数
+        model_dict.update(pretrained_dict)
+        model.load_state_dict(model_dict)
+        
+        print(f"成功加载 {len(pretrained_dict)}/{len(model_dict)} 个预训练参数")
+        print(f"跳过的参数: {set(model_dict.keys()) - set(pretrained_dict.keys())}")
+    else:
+        print("未找到预训练模型，从头开始训练VGGSNNwoAP模型（Baseline实验）")
 
     # preparing training set
     # criterion = nn.CrossEntropyLoss().to(device)

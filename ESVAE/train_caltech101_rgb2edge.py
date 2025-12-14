@@ -32,7 +32,7 @@ from dataloader.caltech101 import get_caltech101
 from pretrain.pretrainer import AlignmentTLTrainer_Edge_1
 from pretrain.pretrainModel import VGGSNN, VGGSNNwoAP
 from pretrain.Edge import SobelEdgeExtractionModule, CannyEdgeDetectionModule
-from tl_utils.loss_function import TET_loss
+from tl_utils.loss_function import TET_loss, TRT_loss
 from tl_utils import common_utils
 
 parser = argparse.ArgumentParser(description='Caltech101 RGB->Edge Pretraining')
@@ -40,7 +40,7 @@ parser.add_argument('--batch_size', default=32, type=int, help='Batchsize')
 parser.add_argument('--optim', default='Adam', type=str, choices=['SGD', 'Adam'], help='Optimizer')
 parser.add_argument('--lr', default=0.001, type=float, help='Learning rate for RGB->Edge pretraining')
 parser.add_argument('--weight_decay', default=5e-4, type=float, help='Weight decay')
-parser.add_argument('--epochs', default=50, type=int, help='RGB->Edge pretraining epochs')
+parser.add_argument('--epochs', default=30, type=int, help='RGB->Edge pretraining epochs')
 parser.add_argument('--device', default='cuda', type=str, help='cuda or cpu')
 parser.add_argument('--parallel', default=False, type=bool, help='Whether to use multi-GPU parallelism')
 parser.add_argument('--T', default=10, type=int, help='snn simulation time (default: 10)')
@@ -65,6 +65,17 @@ parser.add_argument('--checkpoint', type=str, default='/home/user/kpm/kpm/result
                     help='the path of checkpoint dir.')
 parser.add_argument('--GPU_id', type=int, default=0, help='the id of used GPU.')
 parser.add_argument('--RGB_sample_ratio', type=float, default=1.0, help='the ratio of used RGB training set.')
+# TRT (Temporal Regularization Training) 参数
+parser.add_argument('--use_trt', action='store_true', default=False,
+                    help='Whether to use TRT (Temporal Regularization Training) loss')
+parser.add_argument('--trt_decay', type=float, default=0.5,
+                    help='TRT decay factor δ (default: 0.5)')
+parser.add_argument('--trt_lambda', type=float, default=1e-5,
+                    help='TRT regularization coefficient λ (default: 1e-5)')
+parser.add_argument('--trt_epsilon', type=float, default=1e-5,
+                    help='TRT epsilon ε (default: 1e-5)')
+parser.add_argument('--trt_eta', type=float, default=0.05,
+                    help='TRT eta η (MSE loss weight, default: 0.05)')
 
 args = parser.parse_args()
 
@@ -84,7 +95,8 @@ log_name = (
     f"T{args.T}_"
     f"seed{args.seed}_"
     f"RGB{args.RGB_sample_ratio}_"
-    f"SobelCannyEdge"  # 标记使用了Sobel+Canny双边缘提取器
+    f"TWoSobelEdge_"  # 标记使用了Sobel+Canny双边缘提取器
+    f"trt{args.use_trt}"
 )
 
 # 日志目录设置
@@ -194,10 +206,30 @@ if __name__ == "__main__":
     print(f"  编码器类型: {args.encoder_type}")
     print(f"  边缘提取: Sobel + Canny双算法叠加")
     
+    # 选择损失函数：TRT或TET
+    if args.use_trt:
+        print(f"\n使用TRT (Temporal Regularization Training) Loss")
+        print(f"  - TRT decay (δ): {args.trt_decay}")
+        print(f"  - TRT lambda (λ): {args.trt_lambda}")
+        print(f"  - TRT epsilon (ε): {args.trt_epsilon}")
+        print(f"  - TRT eta (η): {args.trt_eta}")
+        # 创建TRT loss函数的wrapper
+        criterion = lambda outputs, labels: TRT_loss(
+            model, outputs, labels, 
+            criterion=torch.nn.CrossEntropyLoss(),
+            decay=args.trt_decay, 
+            lamb=args.trt_lambda, 
+            epsilon=args.trt_epsilon, 
+            eta=args.trt_eta
+        )
+    else:
+        print(f"\n使用TET (Temporal Efficient Training) Loss")
+        criterion = TET_loss
+    
     # RGB->Edge预训练 (使用AlignmentTLTrainer_Edge_1)
     print("\n开始RGB->Edge预训练...")
     trainer = AlignmentTLTrainer_Edge_1(
-        args, device, writer, model, optimizer, TET_loss, scheduler, 
+        args, device, writer, model, optimizer, criterion, scheduler, 
         os.path.join(model_path, "rgb_edge_pretrained.pth")
     )
     

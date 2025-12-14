@@ -29,7 +29,7 @@ from dataloader.caltech101 import *
 from tl_utils.trainer import AlignmentTLTrainerWithProgressBar
 from pretrain.pretrainModel import *
 from tl_utils import common_utils
-from tl_utils.loss_function import TET_loss
+from tl_utils.loss_function import TET_loss, TRT_loss
 
 parser = argparse.ArgumentParser(description='PyTorch RGB to DVS Transfer Learning')
 parser.add_argument('--data_set', type=str, default='CIFAR10',
@@ -74,6 +74,17 @@ parser.add_argument('--use_validation', default=False, type=bool, help='Whether 
 parser.add_argument('--use_cutout', default=False, type=bool, help='Whether to use Cutout data augmentation')
 parser.add_argument('--cutout_length', default=16, type=int, help='Length of cutout square')
 parser.add_argument('--use_grayscale', default=False, type=bool, help='Whether to convert RGB to grayscale (keep 3 channels) for structure-based transfer learning validation')
+# TRT (Temporal Regularization Training) 参数
+parser.add_argument('--use_trt', action='store_true', default=False,
+                    help='Whether to use TRT (Temporal Regularization Training) loss')
+parser.add_argument('--trt_decay', type=float, default=0.5,
+                    help='TRT decay factor δ (default: 0.5)')
+parser.add_argument('--trt_lambda', type=float, default=1e-5,
+                    help='TRT regularization coefficient λ (default: 1e-5)')
+parser.add_argument('--trt_epsilon', type=float, default=1e-5,
+                    help='TRT epsilon ε (default: 1e-5)')
+parser.add_argument('--trt_eta', type=float, default=0.05,
+                    help='TRT eta η (MSE loss weight, default: 0.05)')
 
 args = parser.parse_args()
 
@@ -262,12 +273,32 @@ if __name__ == "__main__":
     else:
         print("  ○ 灰度转换: 未启用 (使用原始RGB色彩信息)")
 
+    # 选择损失函数：TRT或TET
+    if args.use_trt:
+        print(f"\n使用TRT (Temporal Regularization Training) Loss")
+        print(f"  - TRT decay (δ): {args.trt_decay}")
+        print(f"  - TRT lambda (λ): {args.trt_lambda}")
+        print(f"  - TRT epsilon (ε): {args.trt_epsilon}")
+        print(f"  - TRT eta (η): {args.trt_eta}")
+        # 创建TRT loss函数的wrapper
+        criterion = lambda outputs, labels: TRT_loss(
+            model, outputs, labels, 
+            criterion=torch.nn.CrossEntropyLoss(),
+            decay=args.trt_decay, 
+            lamb=args.trt_lambda, 
+            epsilon=args.trt_epsilon, 
+            eta=args.trt_eta
+        )
+    else:
+        print(f"\n使用TET (Temporal Efficient Training) Loss")
+        criterion = TET_loss
+
     # 训练（使用带进度条和灰度支持的AlignmentTLTrainer）
     print("使用AlignmentTLTrainerWithProgressBar进行RGB到DVS迁移学习...")
     if args.use_grayscale:
         print("  ✓ 启用灰度转换: RGB图像将转换为灰度但保持三通道")
     trainer = AlignmentTLTrainerWithProgressBar(
-        args, device, writer, model, optimizer, TET_loss, scheduler, model_path
+        args, device, writer, model, optimizer, criterion, scheduler, model_path
     )
     
     # 根据是否有验证集决定传入参数
