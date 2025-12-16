@@ -43,13 +43,14 @@ parser.add_argument('--weight_decay', default=5e-4, type=float, help='Weight dec
 parser.add_argument('--epochs', default=30, type=int, help='RGB->Edge pretraining epochs')
 parser.add_argument('--device', default='cuda', type=str, help='cuda or cpu')
 parser.add_argument('--parallel', default=False, type=bool, help='Whether to use multi-GPU parallelism')
-parser.add_argument('--T', default=10, type=int, help='snn simulation time (default: 10)')
+parser.add_argument('--T', default=2, type=int, help='snn simulation time (default: 10)')
 parser.add_argument('--encoder_type', type=str, default='time_encoder',
                     choices=['lap_encoder', 'poison_encoder', 'time_encoder'],
                     help='the encoder type of rgb data for snn.')
 parser.add_argument('--seed', type=int, default=1000, help='seed for initializing training.')
 parser.add_argument('--encoder_tl_loss_type', type=str, default='CKA', choices=['TCKA', 'CKA'],
                     help='the transfer loss for encoder.')
+parser.add_argument('--img_shape', type=int, default=48, help='image shape')
 parser.add_argument('--feature_tl_loss_type', type=str, default='TCKA',
                     choices=['TCKA', 'CKA', 'TMSE', 'MSE', 'TMMD', 'MMD'],
                     help='the transfer loss for features.')
@@ -95,8 +96,9 @@ log_name = (
     f"T{args.T}_"
     f"seed{args.seed}_"
     f"RGB{args.RGB_sample_ratio}_"
-    f"TWoSobelEdge_"  # 标记使用了Sobel+Canny双边缘提取器
-    f"trt{args.use_trt}"
+    f"TWoSobelEdge_"  # 标记使用了Sobel边缘提取器
+    f"trt{args.use_trt}_"
+    f"img_shape{args.img_shape}"
 )
 
 # 日志目录设置
@@ -134,9 +136,11 @@ if __name__ == "__main__":
     
     # 准备RGB数据 (用于RGB->Edge预训练)
     print("Loading Caltech101 RGB dataset for RGB->Edge pretraining...")
+    print(f"图像尺寸设置: {args.img_shape}×{args.img_shape}")
     rgb_train_loader, rgb_test_loader = get_caltech101(
         args.batch_size, 
-        args.RGB_sample_ratio
+        args.RGB_sample_ratio,
+        img_size=args.img_shape
     )
     
     print(f"\n=== RGB->Edge预训练数据集信息 ===")
@@ -148,16 +152,16 @@ if __name__ == "__main__":
 
     # 准备模型 - 选择标准VGGSNN模型
     if args.use_woap:
-        model = VGGSNNwoAP(cls_num=args.num_classes, img_shape=48)  # Caltech101使用48x48
+        model = VGGSNNwoAP(cls_num=args.num_classes, img_shape=args.img_shape)
         print("使用VGGSNNwoAP模型 (without Average Pooling)")
         print("  架构: stride=2卷积替代AvgPool2d")
-        print("  图像尺寸: 48×48")
+        print(f"  图像尺寸: {args.img_shape}×{args.img_shape}")
         print("  输入通道: RGB=3通道, Edge=2通道(Sobel+Canny)")
     else:
-        model = VGGSNN(cls_num=args.num_classes, img_shape=48, device=device)  # Caltech101使用48x48
+        model = VGGSNN(cls_num=args.num_classes, img_shape=args.img_shape, device=device)
         print("使用标准VGGSNN模型 (with Average Pooling)")
         print("  架构: AvgPool2d下采样")
-        print("  图像尺寸: 48×48")
+        print(f"  图像尺寸: {args.img_shape}×{args.img_shape}")
         print("  输入通道: RGB=3通道, Edge=2通道(Sobel+Canny)")
 
     # 为模型添加边缘提取器

@@ -12,6 +12,7 @@ import random
 import torch
 import numpy as np
 from collections import Counter
+from PIL import Image
 # 13行的导入有一些问题
 # _utils 856行,可能是torch2.4.1没有这种方法，因此在本文档中定义
 # from torch._utils import _accumulate
@@ -211,7 +212,7 @@ def get_cifar10(batch_size, train_set_ratio=1.0):
     return train_dataloader  # , test_dataloader
 
 
-def get_cifar10_DVS(batch_size, T, split_ratio=0.9, train_set_ratio=1, size=32, encode_type='TET'):
+def get_cifar10_DVS(batch_size, T, split_ratio=0.9, train_set_ratio=1, size=32, encode_type='TET', use_eventrpg=False, eventrpg_mix_prob=0.5):
     """
     get the train loader and test loader of cifar10.
     :param batch_size:
@@ -220,6 +221,8 @@ def get_cifar10_DVS(batch_size, T, split_ratio=0.9, train_set_ratio=1, size=32, 
     :param train_set_ratio: the real used train set ratio
     :param size:
     :param encode_type:
+    :param use_eventrpg: whether to use EventRPG augmentation
+    :param eventrpg_mix_prob: EventRPG mix probability
     :return: train_loader, test_loader
     """
     if encode_type == "spikingjelly":
@@ -244,8 +247,8 @@ def get_cifar10_DVS(batch_size, T, split_ratio=0.9, train_set_ratio=1, size=32, 
         path = '/home/user/Datasets/CIFAR10/CIFAR10DVS/temporal_effecient_training_0.9_mat'
         train_path = path + '/train'
         test_path = path + '/test'
-        train_set = DVSCifar10v1(root=train_path)
-        test_set = DVSCifar10v1(root=test_path)
+        train_set = DVSCifar10v1(root=train_path, train=True, transform=True, use_eventrpg=use_eventrpg, eventrpg_mix_prob=eventrpg_mix_prob)
+        test_set = DVSCifar10v1(root=test_path, train=False, transform=False, use_eventrpg=False)
     elif encode_type == "3_channel":
         path = '/home/user/Datasets/CIFAR10/CIFAR10DVS/temporal_effecient_training_0.9_mat'
         train_path = path + '/train'
@@ -339,7 +342,7 @@ class DVSCifar10(Dataset):
 
 
 class DVSCifar10v1(Dataset):
-    def __init__(self, root, train=True, transform=True, target_transform=None, use_nda=False):
+    def __init__(self, root, train=True, transform=True, target_transform=None, use_nda=False, use_eventrpg=False, eventrpg_mix_prob=0.5):
         """
         DVS CIFAR10数据集
         
@@ -349,12 +352,15 @@ class DVSCifar10v1(Dataset):
             transform: 是否使用数据增强 (传统方法: flip + roll)
             target_transform: 目标变换
             use_nda: 是否使用NDA_SNN的数据增强方法 (roll/rotate/shear随机选择)
+            use_eventrpg: 是否使用EventRPG的数据增强方法 (几何增强+RPGMix)
+            eventrpg_mix_prob: EventRPG的RPGMix概率
         """
         self.root = os.path.expanduser(root)
         self.transform = transform
         self.target_transform = target_transform
         self.train = train
         self.use_nda = use_nda
+        self.use_eventrpg = use_eventrpg
         self.resize = transforms.Resize(size=(48, 48))
         self.tensorx = transforms.ToTensor()
         self.imgx = transforms.ToPILImage()
@@ -367,6 +373,11 @@ class DVSCifar10v1(Dataset):
         # 初始化NDA增强器
         if self.use_nda:
             self.nda_augment = DVSAugmentCIFAR10(apply_prob=1.0)
+        
+        # 初始化EventRPG增强器
+        if self.use_eventrpg:
+            from .eventrpg_augment import EventRPGAugment
+            self.eventrpg_augment = EventRPGAugment(img_size=48, mix_prob=eventrpg_mix_prob)
 
     def _build_index(self):
         class_dirs = sorted(os.listdir(self.root))
@@ -393,7 +404,10 @@ class DVSCifar10v1(Dataset):
         data = torch.stack(new_data, dim=0)
 
         if self.transform:
-            if self.use_nda:
+            if self.use_eventrpg:
+                # 使用EventRPG的增强方法 (几何增强+RPGMix)
+                data = self.eventrpg_augment(data)
+            elif self.use_nda:
                 # 使用NDA_SNN的增强方法 (roll/rotate/shear随机选择)
                 data = self.nda_augment(data)
             else:

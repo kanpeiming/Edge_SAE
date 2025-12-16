@@ -24,7 +24,10 @@ dataset_path/
 3. 使用NDA数据增强训练:
    python train_caltech101_baseline.py --use_nda --batch_size 32 --lr 0.001 --epoch 100
 
-4. 使用预训练模型:
+4. 使用EventRPG数据增强训练:
+   python train_caltech101_baseline.py --use_eventrpg --eventrpg_mix_prob 0.5 --batch_size 32
+
+5. 使用预训练模型:
    python train_caltech101_baseline.py --pretrained_path /path/to/pretrained.pth --lr 0.0001
 
 参数说明:
@@ -35,6 +38,8 @@ dataset_path/
 - size: 输入图像尺寸 (默认48)
 - dvs_sample_ratio: 训练集使用比例 (默认1.0)
 - use_nda: 是否使用NDA数据增强 (默认False，包含水平翻转0.5+roll/rotate/shear随机选择)
+- use_eventrpg: 是否使用EventRPG数据增强 (默认False，包含几何增强+RPGMix)
+- eventrpg_mix_prob: EventRPG的RPGMix概率 (默认0.5)
 
 特性:
 - 模块化数据加载器（位于dataloader.caltech101模块）
@@ -56,10 +61,10 @@ from models.snn_models.VGG import VGGSNN, VGGSNNwoAP
 from torch.utils.tensorboard import SummaryWriter
 
 parser = argparse.ArgumentParser(description='PyTorch Temporal Efficient Training for N-Caltech101')
-parser.add_argument('--batch_size', default=32, type=int, help='Batchsize')
+parser.add_argument('--batch_size', default=64, type=int, help='Batchsize')
 parser.add_argument('--lr', default=0.001, type=float, help='Learning rate')
 parser.add_argument('--weight_decay', default=5e-4, type=float, help='Weight decay')
-parser.add_argument('--epoch', default=100, type=int, help='Training epochs')
+parser.add_argument('--epoch', default=60, type=int, help='Training epochs')
 parser.add_argument('--id', default='caltech101_baseline', type=str, help='Model identifier')
 parser.add_argument('--device', default='cuda', type=str, help='cuda or cpu')
 parser.add_argument('--parallel', default=False, type=bool, help='Whether to use multi-GPU parallelism')
@@ -80,6 +85,11 @@ parser.add_argument('--caltech101_dvs_path', type=str, default='/home/user/kpm/k
 # NDA (Neuromorphic Data Augmentation) 参数
 parser.add_argument('--use_nda', action='store_true', default=False,
                     help='Whether to use NDA (Neuromorphic Data Augmentation) including flip(0.5) + roll/rotate/shear')
+# EventRPG 数据增强参数
+parser.add_argument('--use_eventrpg', action='store_true', default=False,
+                    help='Whether to use EventRPG data augmentation (Geometric + RPGDrop + RPGMix)')
+parser.add_argument('--eventrpg_mix_prob', type=float, default=0.5,
+                    help='EventRPG RPGMix probability (default: 0.5)')
 # TRT (Temporal Regularization Training) 参数
 parser.add_argument('--use_trt', action='store_true', default=False,
                     help='Whether to use TRT (Temporal Regularization Training) loss')
@@ -101,7 +111,8 @@ args.data_set = 'Caltech101'
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 # 日志名称 加载预训练参数，改变一下命名为微调
-log_name = f"FT_{args.fine_tuning}_NCaltech101_baseline_lr{args.lr}_T{args.T}_bs{args.batch_size}_seed{args.seed}_nda{args.use_nda}_trt{args.use_trt}"
+eventrpg_tag = f"_EventRPG-mix{args.eventrpg_mix_prob}" if args.use_eventrpg else ""
+log_name = f"FT_{args.fine_tuning}_NCaltech101_baseline_lr{args.lr}_T{args.T}_bs{args.batch_size}_seed{args.seed}_nda{args.use_nda}_trt{args.use_trt}_{eventrpg_tag}_imageSize{args.size}"
 
 # 创建日志和检查点目录
 os.makedirs(args.log_dir, exist_ok=True)
@@ -120,10 +131,20 @@ if __name__ == "__main__":
     # 准备数据
     print("Loading N-Caltech101 dataset...")
     print(f"Dataset path: {args.caltech101_dvs_path}")
-    print(f"Using NDA augmentation: {args.use_nda}")
-    if args.use_nda:
+    
+    # 打印数据增强信息
+    if args.use_eventrpg:
+        print(f"Using EventRPG augmentation:")
+        print(f"  - Geometric augmentation: Identity/Flip/Rotate/Scale/Translation/Shear (randomly selected)")
+        print(f"  - RPGMix probability: {args.eventrpg_mix_prob}")
+    elif args.use_nda:
+        print(f"Using NDA augmentation:")
         print("  - Horizontal flip: 50% probability")
         print("  - Random augmentation: Roll/Rotate/Shear (one selected randomly)")
+    else:
+        print("Using traditional augmentation:")
+        print("  - Horizontal flip: 50% probability")
+        print("  - Random translation")
     
     train_loader, test_loader = create_caltech101_dataloaders(
         data_path=args.caltech101_dvs_path,
@@ -131,7 +152,9 @@ if __name__ == "__main__":
         train_ratio=args.dvs_sample_ratio,
         num_workers=8,
         img_size=args.size,
-        use_nda=args.use_nda  # 传递NDA参数
+        use_nda=args.use_nda,  # 传递NDA参数
+        use_eventrpg=args.use_eventrpg,  # 传递EventRPG参数
+        eventrpg_mix_prob=args.eventrpg_mix_prob
     )
 
     # 准备模型 - N-Caltech101有101个类别

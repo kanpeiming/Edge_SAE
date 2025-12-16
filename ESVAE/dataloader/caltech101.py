@@ -24,6 +24,10 @@ def get_tl_caltech101(batch_size, train_set_ratio=1.0, dvs_train_set_ratio=1.0):
     """
     get the train loader which yield rgb_img and dvs_img with label
     and test loader which yield dvs_img with label of caltech101.
+    
+    N-Caltech101标准: 保留BACKGROUND_Google，移除Faces类
+    最终101类 = 100个物体类 + 1个背景类(BACKGROUND_Google)
+    
     :return: train_loader, test_loader
     """
     rgb_trans_train = transforms.Compose([
@@ -64,7 +68,18 @@ def get_tl_caltech101(batch_size, train_set_ratio=1.0, dvs_train_set_ratio=1.0):
     return train_dataloader, test_dataloader
 
 
-def get_caltech101(batch_size, train_set_ratio=1.0):
+def get_caltech101(batch_size, train_set_ratio=1.0, img_size=48):
+    """
+    获取Caltech101 RGB数据加载器
+    
+    N-Caltech101标准: 保留BACKGROUND_Google，移除Faces类
+    最终101类 = 100个物体类 + 1个背景类(BACKGROUND_Google)
+    
+    Args:
+        batch_size: 批次大小
+        train_set_ratio: 训练集使用比例
+        img_size: 图像尺寸 (默认48)
+    """
     # 自定义变换类来处理灰度图像转RGB
     class GrayscaleToRGB:
         def __call__(self, img):
@@ -78,19 +93,16 @@ def get_caltech101(batch_size, train_set_ratio=1.0):
                                       # transforms.RandomHorizontalFlip(p=0.5), # 概率50%水平翻转
                                       # transforms.RandomRotation((-15,15)), # 随机旋转，角度范围为 -15° – 15°
                                       # transforms.ColorJitter(), # 随机的颜色调整
-                                      transforms.Resize((48, 48)),
+                                      transforms.Resize((img_size, img_size)),
                                       transforms.ToTensor(),
                                       transforms.Normalize((0.5429, 0.5263, 0.4994), (0.2422, 0.2392, 0.2406)),  # RGB归一化
                                       ])
     trans_test = transforms.Compose([GrayscaleToRGB(),  # 确保所有图像都是RGB格式
-                                     transforms.Resize((48, 48)),
+                                     transforms.Resize((img_size, img_size)),
                                      transforms.ToTensor(),
                                      transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))]) 
 
     # 使用本地准备好的数据集
-    # 数据集路径: /home/user/kpm/kpm/Dataset/Caltech101/caltech101/101_ObjectCategories
-    # PyTorch期望的结构: root/101_ObjectCategories/类别名/图片
-    # datasets.Caltech101 需要的是包含 101_ObjectCategories 的父目录
     caltech101_root = os.path.dirname(DIR['Caltech101'])  # /home/user/kpm/kpm/Dataset/Caltech101/caltech101
     
     # 检查本地数据集是否存在
@@ -108,55 +120,53 @@ def get_caltech101(batch_size, train_set_ratio=1.0):
             tar.extractall(path=caltech101_root)
     
     # 优先尝试使用 torchvision 自带的 Caltech101 类
-    # 如果因为 MD5 校验或其他原因被认为“损坏”，则回退到 ImageFolder 方式加载
+    # 如果因为 MD5 校验或其他原因被认为"损坏"，则回退到 ImageFolder 方式加载
     try:
         train_data = datasets.Caltech101(caltech101_root, transform=trans_train, download=False)
         test_data = datasets.Caltech101(caltech101_root, transform=trans_test, download=False)
     except RuntimeError:
         # 静默回退到 ImageFolder 加载方式
-        # 注意：需要过滤掉 BACKGROUND_Google 类别（如果存在）
+        # N-Caltech101标准: 保留BACKGROUND_Google，移除Faces类
         from torch.utils.data import Subset
         
         full_train_data = datasets.ImageFolder(DIR['Caltech101'], transform=trans_train)
         full_test_data = datasets.ImageFolder(DIR['Caltech101'], transform=trans_test)
         
-        # 检查类别数量，如果是102则需要过滤
-        if len(full_train_data.classes) == 102:
-            # 找到 BACKGROUND_Google 的索引并过滤
-            bg_idx = full_train_data.class_to_idx.get('BACKGROUND_Google', -1)
-            if bg_idx != -1:
-                # 过滤掉 BACKGROUND_Google 类别的样本
-                train_indices = [i for i, (_, label) in enumerate(full_train_data.samples) if label != bg_idx]
-                test_indices = [i for i, (_, label) in enumerate(full_test_data.samples) if label != bg_idx]
+        # 查找需要移除的Faces类索引（N-Caltech101标准）
+        faces_idx = full_train_data.class_to_idx.get('Faces', 
+                    full_train_data.class_to_idx.get('faces', -1))
+        
+        if faces_idx != -1:
+            # 过滤掉Faces类别的样本（保留BACKGROUND_Google）
+            train_indices = [i for i, (_, label) in enumerate(full_train_data.samples) if label != faces_idx]
+            test_indices = [i for i, (_, label) in enumerate(full_test_data.samples) if label != faces_idx]
+            
+            train_data = Subset(full_train_data, train_indices)
+            test_data = Subset(full_test_data, test_indices)
+            
+            # 重新映射标签：移除Faces类后重新编号
+            class LabelRemapDataset(torch.utils.data.Dataset):
+                def __init__(self, subset, removed_idx):
+                    self.subset = subset
+                    self.removed_idx = removed_idx
                 
-                train_data = Subset(full_train_data, train_indices)
-                test_data = Subset(full_test_data, test_indices)
+                def __getitem__(self, idx):
+                    img, label = self.subset[idx]
+                    # 如果标签大于removed_idx，减1以填补空缺
+                    if label > self.removed_idx:
+                        label = label - 1
+                    return img, label
                 
-                # 重新映射标签：将 [0-100, 102] 映射到 [0-100]
-                # 创建包装器来调整标签
-                class LabelRemapDataset(torch.utils.data.Dataset):
-                    def __init__(self, subset, bg_idx):
-                        self.subset = subset
-                        self.bg_idx = bg_idx
-                    
-                    def __getitem__(self, idx):
-                        img, label = self.subset[idx]
-                        # 如果标签大于 bg_idx，减1以填补空缺
-                        if label > self.bg_idx:
-                            label = label - 1
-                        return img, label
-                    
-                    def __len__(self):
-                        return len(self.subset)
-                
-                train_data = LabelRemapDataset(train_data, bg_idx)
-                test_data = LabelRemapDataset(test_data, bg_idx)
-            else:
-                train_data = full_train_data
-                test_data = full_test_data
+                def __len__(self):
+                    return len(self.subset)
+            
+            train_data = LabelRemapDataset(train_data, faces_idx)
+            test_data = LabelRemapDataset(test_data, faces_idx)
+            print(f"✓ [N-Caltech101标准] 移除Faces类，保留BACKGROUND_Google，共101类")
         else:
             train_data = full_train_data
             test_data = full_test_data
+            print(f"✓ [get_caltech101] 使用所有{len(full_train_data.classes)}个类别")
 
     # take train set by train_set_ratio
     n_train = len(train_data)
@@ -181,6 +191,9 @@ def get_caltech101_gray(batch_size, train_set_ratio=1.0):
     """
     获取Caltech101灰度图数据加载器（用于消融实验2）
     将RGB图像转换为灰度图，然后扩展为3通道（复制灰度值）以适配模型
+    
+    N-Caltech101标准: 保留BACKGROUND_Google，移除Faces类
+    最终101类 = 100个物体类 + 1个背景类
     
     Args:
         batch_size: 批次大小
@@ -238,49 +251,47 @@ def get_caltech101_gray(batch_size, train_set_ratio=1.0):
         test_data = datasets.Caltech101(caltech101_root, transform=trans_test, download=False)
     except RuntimeError:
         # 静默回退到 ImageFolder 加载方式
-        # 注意：需要过滤掉 BACKGROUND_Google 类别（如果存在）
+        # N-Caltech101标准: 保留BACKGROUND_Google，移除Faces类
         from torch.utils.data import Subset
         
         full_train_data = datasets.ImageFolder(DIR['Caltech101'], transform=trans_train)
         full_test_data = datasets.ImageFolder(DIR['Caltech101'], transform=trans_test)
         
-        # 检查类别数量，如果是102则需要过滤
-        if len(full_train_data.classes) == 102:
-            # 找到 BACKGROUND_Google 的索引并过滤
-            bg_idx = full_train_data.class_to_idx.get('BACKGROUND_Google', -1)
-            if bg_idx != -1:
-                # 过滤掉 BACKGROUND_Google 类别的样本
-                train_indices = [i for i, (_, label) in enumerate(full_train_data.samples) if label != bg_idx]
-                test_indices = [i for i, (_, label) in enumerate(full_test_data.samples) if label != bg_idx]
+        # 查找需要移除的Faces类索引（N-Caltech101标准）
+        faces_idx = full_train_data.class_to_idx.get('Faces', 
+                    full_train_data.class_to_idx.get('faces', -1))
+        
+        if faces_idx != -1:
+            # 过滤掉Faces类别的样本（保留BACKGROUND_Google）
+            train_indices = [i for i, (_, label) in enumerate(full_train_data.samples) if label != faces_idx]
+            test_indices = [i for i, (_, label) in enumerate(full_test_data.samples) if label != faces_idx]
+            
+            train_data = Subset(full_train_data, train_indices)
+            test_data = Subset(full_test_data, test_indices)
+            
+            # 重新映射标签：移除Faces类后重新编号
+            class LabelRemapDataset(torch.utils.data.Dataset):
+                def __init__(self, subset, removed_idx):
+                    self.subset = subset
+                    self.removed_idx = removed_idx
                 
-                train_data = Subset(full_train_data, train_indices)
-                test_data = Subset(full_test_data, test_indices)
+                def __getitem__(self, idx):
+                    img, label = self.subset[idx]
+                    # 如果标签大于removed_idx，减1以填补空缺
+                    if label > self.removed_idx:
+                        label = label - 1
+                    return img, label
                 
-                # 重新映射标签：将 [0-100, 102] 映射到 [0-100]
-                # 创建包装器来调整标签
-                class LabelRemapDataset(torch.utils.data.Dataset):
-                    def __init__(self, subset, bg_idx):
-                        self.subset = subset
-                        self.bg_idx = bg_idx
-                    
-                    def __getitem__(self, idx):
-                        img, label = self.subset[idx]
-                        # 如果标签大于 bg_idx，减1以填补空缺
-                        if label > self.bg_idx:
-                            label = label - 1
-                        return img, label
-                    
-                    def __len__(self):
-                        return len(self.subset)
-                
-                train_data = LabelRemapDataset(train_data, bg_idx)
-                test_data = LabelRemapDataset(test_data, bg_idx)
-            else:
-                train_data = full_train_data
-                test_data = full_test_data
+                def __len__(self):
+                    return len(self.subset)
+            
+            train_data = LabelRemapDataset(train_data, faces_idx)
+            test_data = LabelRemapDataset(test_data, faces_idx)
+            print(f"✓ [N-Caltech101标准-灰度] 移除Faces类，保留BACKGROUND_Google，共101类")
         else:
             train_data = full_train_data
-            test_data = full_test_data 
+            test_data = full_test_data
+            print(f"✓ [get_caltech101_gray] 使用所有{len(full_train_data.classes)}个类别") 
 
     # take train set by train_set_ratio
     n_train = len(train_data)
@@ -301,7 +312,7 @@ def get_caltech101_gray(batch_size, train_set_ratio=1.0):
     return train_dataloader, test_dataloader
 
 
-def get_n_caltech101(batch_size,T,split_ratio=0.9,train_set_ratio=1.0,size=224,encode_type='TET'):
+def get_n_caltech101(batch_size,T,split_ratio=0.9,train_set_ratio=1.0,size=224,encode_type='TET',use_eventrpg=False,eventrpg_mix_prob=0.5):
     if encode_type is "spikingjelly":
 
         trans = DVSResize((size, size), T)
@@ -325,8 +336,8 @@ def get_n_caltech101(batch_size,T,split_ratio=0.9,train_set_ratio=1.0,size=224,e
         path = '/home/user/kpm/kpm/Dataset/Caltech101/n-caltech101'
         train_path = path + '/train'
         test_path = path + '/test'
-        train_set = NCaltech101(root=train_path)
-        test_set = NCaltech101(root=test_path)
+        train_set = NCaltech101(root=train_path, train=True, transform=True, use_eventrpg=use_eventrpg, eventrpg_mix_prob=eventrpg_mix_prob)
+        test_set = NCaltech101(root=test_path, train=False, transform=False, use_eventrpg=False)
     elif encode_type is "3_channel":
         pass
 
@@ -352,14 +363,20 @@ def get_n_caltech101(batch_size,T,split_ratio=0.9,train_set_ratio=1.0,size=224,e
 
 class NCaltech101(Dataset):
     # This code is form https://github.com/Gus-Lab/temporal_efficient_training
-    def __init__(self, root, train=True, transform=True, target_transform=None):
+    def __init__(self, root, train=True, transform=True, target_transform=None, use_eventrpg=False, eventrpg_mix_prob=0.5):
         self.root = os.path.expanduser(root)
         self.transform = transform
         self.target_transform = target_transform
         self.train = train
+        self.use_eventrpg = use_eventrpg
         self.resize = transforms.Resize(size=(48, 48))  # 128 128
         self.tensorx = transforms.ToTensor()
         self.imgx = transforms.ToPILImage()
+        
+        # 初始化EventRPG增强器
+        if self.use_eventrpg:
+            from .eventrpg_augment import EventRPGAugment
+            self.eventrpg_augment = EventRPGAugment(img_size=48, mix_prob=eventrpg_mix_prob)
 
     def __getitem__(self, index):
         
@@ -378,12 +395,17 @@ class NCaltech101(Dataset):
         data = torch.stack(new_data, dim=0)
         
         if self.transform:
-            flip = random.random() > 0.5
-            if flip:
-                data = torch.flip(data, dims=(3,))
-            off1 = random.randint(-5, 5)
-            off2 = random.randint(-5, 5)
-            data = torch.roll(data, shifts=(off1, off2), dims=(2, 3))
+            if self.use_eventrpg:
+                # 使用EventRPG的增强方法
+                data = self.eventrpg_augment(data)
+            else:
+                # 使用传统增强方法
+                flip = random.random() > 0.5
+                if flip:
+                    data = torch.flip(data, dims=(3,))
+                off1 = random.randint(-5, 5)
+                off2 = random.randint(-5, 5)
+                data = torch.roll(data, shifts=(off1, off2), dims=(2, 3))
     
         if self.target_transform is not None:
             target = self.target_transform(target)
@@ -443,17 +465,21 @@ class TLCaltech101(Dataset):
         注意：RGB数据没有train/test划分，无论在训练还是测试模式都加载全部RGB数据
         在训练模式下，RGB数据会与DVS的train数据配对
         在测试模式下，只使用DVS的test数据（不使用RGB数据）
+        
+        N-Caltech101标准: 保留BACKGROUND_Google，移除Faces类
+        最终101类 = 100个物体类 + 1个背景类
         """
         if not os.path.exists(self.root):
             raise FileNotFoundError(f"RGB数据目录不存在: {self.root}")
         
-        # 获取所有类别目录，排除BACKGROUND_Google
+        # 获取所有类别目录
         all_dirs = [d for d in os.listdir(self.root) 
                    if os.path.isdir(os.path.join(self.root, d))]
         
-        # 过滤掉BACKGROUND_Google类别（Caltech101标准做法）
+        # N-Caltech101标准: 保留BACKGROUND_Google，移除Faces类
+        # 原始Caltech101有102类，N-Caltech101保留101类（包含BACKGROUND_Google，移除Faces）
         self.categories = sorted([d for d in all_dirs 
-                                if d != 'BACKGROUND_Google'])
+                                if d != 'Faces' and d != 'faces'])
         
         if len(self.categories) == 0:
             raise FileNotFoundError(f"在 {self.root} 中未找到有效类别目录")
@@ -473,7 +499,7 @@ class TLCaltech101(Dataset):
                 self.y.append(class_idx)
                 self.index.append(img_idx)
         
-        print(f"✓ RGB: {len(self.categories)} 类, {len(self.rgb_data)} 样本")
+        print(f"✓ RGB [N-Caltech101标准]: {len(self.categories)} 类 (保留BACKGROUND_Google，移除Faces), {len(self.rgb_data)} 样本")
         self.cumulative_sizes = self.cumsum(self.y)
 
     def _load_dvs_data(self):
@@ -710,18 +736,21 @@ class NCaltech101Dataset(Dataset):
     优化的N-Caltech101数据集类
     支持灵活的文件命名格式和数据增强
     """
-    def __init__(self, root, transform=True, img_size=224, use_nda=False):
+    def __init__(self, root, transform=True, img_size=224, use_nda=False, use_eventrpg=False, eventrpg_mix_prob=0.5):
         """
         Args:
             root: 数据根目录
             transform: 是否使用数据增强
             img_size: 图像尺寸
             use_nda: 是否使用NDA_SNN的数据增强方法
+            use_eventrpg: 是否使用EventRPG的数据增强方法
+            eventrpg_mix_prob: EventRPG的RPGMix概率
         """
         self.root = os.path.expanduser(root)
         self.transform = transform
         self.img_size = img_size
         self.use_nda = use_nda
+        self.use_eventrpg = use_eventrpg
         self.resize = transforms.Resize(size=(img_size, img_size))
         self.to_tensor = transforms.ToTensor()
         self.to_pil = transforms.ToPILImage()
@@ -733,6 +762,11 @@ class NCaltech101Dataset(Dataset):
         # 初始化NDA增强器
         if self.use_nda:
             self.nda_augment = DVSAugmentCaltech101(apply_prob=1.0)
+        
+        # 初始化EventRPG增强器
+        if self.use_eventrpg:
+            from .eventrpg_augment import EventRPGAugment
+            self.eventrpg_augment = EventRPGAugment(img_size=img_size, mix_prob=eventrpg_mix_prob)
 
     def _build_file_list(self):
         """构建并排序文件列表"""
@@ -849,7 +883,10 @@ class NCaltech101Dataset(Dataset):
         
         # 数据增强
         if self.transform:
-            if self.use_nda:
+            if self.use_eventrpg:
+                # 使用EventRPG的增强方法 (几何增强+RPGMix)
+                data = self.eventrpg_augment(data)
+            elif self.use_nda:
                 # 使用NDA_SNN的增强方法
                 data = self.nda_augment(data)
             else:
@@ -866,7 +903,7 @@ class NCaltech101Dataset(Dataset):
         return len(self.files)
 
 
-def create_caltech101_dataloaders(data_path, batch_size, train_ratio=1.0, num_workers=8, img_size=224, use_nda=False):
+def create_caltech101_dataloaders(data_path, batch_size, train_ratio=1.0, num_workers=8, img_size=224, use_nda=False, use_eventrpg=False, eventrpg_mix_prob=0.5):
     """
     创建N-Caltech101数据加载器
     
@@ -877,6 +914,8 @@ def create_caltech101_dataloaders(data_path, batch_size, train_ratio=1.0, num_wo
         num_workers: 数据加载线程数
         img_size: 图像尺寸
         use_nda: 是否使用NDA_SNN的数据增强方法
+        use_eventrpg: 是否使用EventRPG的数据增强方法
+        eventrpg_mix_prob: EventRPG的RPGMix概率
     
     Returns:
         train_loader, test_loader
@@ -892,8 +931,8 @@ def create_caltech101_dataloaders(data_path, batch_size, train_ratio=1.0, num_wo
         raise FileNotFoundError(f"train/test directories not found in {data_path}")
     
     # 创建数据集
-    train_dataset = NCaltech101Dataset(train_path, transform=True, img_size=img_size, use_nda=use_nda)
-    test_dataset = NCaltech101Dataset(test_path, transform=False, img_size=img_size, use_nda=False)
+    train_dataset = NCaltech101Dataset(train_path, transform=True, img_size=img_size, use_nda=use_nda, use_eventrpg=use_eventrpg, eventrpg_mix_prob=eventrpg_mix_prob)
+    test_dataset = NCaltech101Dataset(test_path, transform=False, img_size=img_size, use_nda=False, use_eventrpg=False)
     
     print(f"Dataset loaded: {len(train_dataset)} train, {len(test_dataset)} test samples")
     

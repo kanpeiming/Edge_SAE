@@ -1,5 +1,7 @@
 import os
 import bisect
+import random
+import torch
 from collections import Counter
 from spikingjelly.datasets import n_mnist
 from .dataloader_utils import (
@@ -102,7 +104,7 @@ def get_mnist(batch_size, train_set_ratio=1.0):
     return train_dataloader  # , test_dataloader
 
 
-def get_n_mnist(batch_size, T, split_ratio=0.9, train_set_ratio=1.0, size=32, encode_type='TET'):
+def get_n_mnist(batch_size, T, split_ratio=0.9, train_set_ratio=1.0, size=32, encode_type='TET', use_eventrpg=False, eventrpg_mix_prob=0.5):
     if encode_type == "spikingjelly":
         trans = DVSResize((size, size), T)
 
@@ -126,8 +128,8 @@ def get_n_mnist(batch_size, T, split_ratio=0.9, train_set_ratio=1.0, size=32, en
         path = DIR['MNISTDVS']
         train_path = os.path.join(path, 'train')
         test_path = os.path.join(path, 'test')
-        train_set = NMNIST1(root=train_path)
-        test_set = NMNIST1(root=test_path)
+        train_set = NMNIST1(root=train_path, train=True, transform=True, use_eventrpg=use_eventrpg, eventrpg_mix_prob=eventrpg_mix_prob)
+        test_set = NMNIST1(root=test_path, train=False, transform=False, use_eventrpg=False)
     # elif encode_type is "3_channel":
     #     path = '/data/zhan/Event_Camera_Datasets/CIFAR10DVS/temporal_effecient_training_0.9'
     #     train_path = path + '/train'
@@ -200,7 +202,7 @@ class NMNIST(Dataset):
 
 
 class NMNIST1(Dataset):
-    def __init__(self, root, train=True, transform=True, target_transform=None, use_nda=False):
+    def __init__(self, root, train=True, transform=True, target_transform=None, use_nda=False, use_eventrpg=False, eventrpg_mix_prob=0.5):
         """
         N-MNIST数据集
         
@@ -210,12 +212,15 @@ class NMNIST1(Dataset):
             transform: 是否使用数据增强
             target_transform: 目标变换
             use_nda: 是否使用NDA_SNN的数据增强方法
+            use_eventrpg: 是否使用EventRPG的数据增强方法
+            eventrpg_mix_prob: EventRPG的RPGMix概率
         """
         self.root = os.path.expanduser(root)
         self.transform = transform
         self.target_transform = target_transform
         self.train = train
         self.use_nda = use_nda
+        self.use_eventrpg = use_eventrpg
         self.resize = transforms.Resize(size=(32, 32))
         self.tensorx = transforms.ToTensor()
         self.imgx = transforms.ToPILImage()
@@ -235,6 +240,11 @@ class NMNIST1(Dataset):
                 apply_prob=1.0,
                 flip_prob=0.5  # 50%概率水平翻转
             )
+        
+        # 初始化EventRPG增强器
+        if self.use_eventrpg:
+            from .eventrpg_augment import EventRPGAugment
+            self.eventrpg_augment = EventRPGAugment(img_size=32, mix_prob=eventrpg_mix_prob)
 
     def _build_index(self):
         class_dirs = sorted(os.listdir(self.root))
@@ -263,7 +273,10 @@ class NMNIST1(Dataset):
             data = torch.stack(new_data, dim=0)
 
             if self.transform:
-                if self.use_nda:
+                if self.use_eventrpg:
+                    # 使用EventRPG的增强方法
+                    data = self.eventrpg_augment(data)
+                elif self.use_nda:
                     # 使用NDA_SNN的增强方法
                     data = self.nda_augment(data)
                 else:

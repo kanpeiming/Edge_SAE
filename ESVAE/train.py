@@ -36,7 +36,7 @@ parser.add_argument('--epochs', default=30, type=int, help='Training epochs')
 # parser.add_argument('--id', default='test', type=str, help='Model identifier')
 parser.add_argument('--device', default='cuda', type=str, help='cuda or cpu')
 parser.add_argument('--parallel', default=False, type=bool, help='Whether to use multi-GPU parallelism')
-parser.add_argument('--T', default=10, type=int, help='snn simulation time (default: 10)')
+parser.add_argument('--T', default=2, type=int, help='snn simulation time (default: 10)')
 parser.add_argument('--encoder_type', type=str, default='time_encoder',
                     choices=['lap_encoder', 'poison_encoder', 'time_encoder'],
                     help='the encoder type of rgb data for snn.')
@@ -85,8 +85,7 @@ log_name = (
     f"lr{args.lr}_"
     f"T{args.T}_"
     f"seed{args.seed}_"
-    f"TwoChannelBase{args.edge_method}_"
-    f"woAP"
+    f"TwoChannelBase{args.edge_method}"
 )
 
 # 对应的路径设置
@@ -160,7 +159,7 @@ if __name__ == "__main__":
     #     print("测试集DVS数量", dvs_test_loader_list[0].get_len()[1] * len(dvs_test_loader_list))
 
     # preparing model  选择模型
-    model = VGGSNNwoAP(cls_num=10, img_shape=48)  # RGB CIFAR10是32x32
+    model = VGGSNN(cls_num=10, img_shape=48)  # RGB CIFAR10是32x32
 
     # 为模型添加边缘提取器（用于RGB->Edge训练）
     model.edge_extractor1 = SobelEdgeExtractionModule(device=device, in_channels=3)
