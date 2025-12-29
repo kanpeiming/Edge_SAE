@@ -969,3 +969,323 @@ def create_caltech101_dataloaders(data_path, batch_size, train_ratio=1.0, num_wo
     )
     
     return train_loader, test_loader
+
+
+# ============================================================================
+# Stage 1: Event-aware Bridge Pretraining Dataset
+# ============================================================================
+
+class Stage1BridgeDataset(Dataset):
+    """
+    Stage 1 Bridge训练数据集（优化版：使用预处理的edge数据）
+    
+    目标：category-level匹配的RGB-edge和DVS数据
+    行为：
+    - 每次迭代采样一个类别
+    - 从该类别中分别取edge样本和DVS样本
+    - edge数据已预处理（节省显存）
+    - DVS样本作为真实事件数据
+    
+    注意：不要求instance-level对齐，只要求类别一致
+    """
+    
+    def __init__(self, edge_root, dvs_root, train=True, edge_transform=None, 
+                 dvs_transform=None, img_size=48):
+        """
+        Args:
+            edge_root: 预处理的Edge数据根目录（包含.pt文件）
+            dvs_root: DVS数据根目录（train或test子目录）
+            train: 训练模式（True）或测试模式（False）
+            edge_transform: Edge数据变换（通常不需要）
+            dvs_transform: DVS数据变换
+            img_size: 图像尺寸
+        """
+        self.edge_root = edge_root
+        self.dvs_root = dvs_root
+        self.train = train
+        self.edge_transform = edge_transform
+        self.dvs_transform = dvs_transform
+        self.img_size = img_size
+        
+        # 加载数据
+        self._load_edge_data()
+        self._load_dvs_data_via_nCaltech101()  # 使用NCaltech101来获取正确标签
+        
+        # 构建类别索引
+        self._build_category_index()
+    
+    def _load_edge_data(self):
+        """加载预处理的Edge数据"""
+        if not os.path.exists(self.edge_root):
+            raise FileNotFoundError(f"Edge数据目录不存在: {self.edge_root}")
+        
+        # 获取所有.pt文件
+        pt_files = [f for f in os.listdir(self.edge_root) if f.endswith('.pt')]
+        
+        if len(pt_files) == 0:
+            raise FileNotFoundError(f"Edge目录中没有找到.pt文件: {self.edge_root}")
+        
+        # 排序
+        def extract_number(filename):
+            try:
+                return int(filename.replace('.pt', ''))
+            except ValueError:
+                return 0
+        
+        pt_files = sorted(pt_files, key=extract_number)
+        
+        self.edge_data = []
+        self.edge_labels = []
+        
+        print(f"  正在加载Edge数据 (共 {len(pt_files)} 个文件)...")
+        
+        for file_name in pt_files:
+            file_path = os.path.join(self.edge_root, file_name)
+            try:
+                edge, label = torch.load(file_path, weights_only=True)
+                
+                # 处理标签
+                if isinstance(label, torch.Tensor):
+                    label = label.item() if label.numel() == 1 else label[0].item()
+                
+                self.edge_data.append(edge)  # edge已经是tensor，直接存储
+                self.edge_labels.append(int(label))
+                
+            except Exception as e:
+                print(f"  警告: 无法加载Edge文件 {file_name}: {e}")
+                continue
+        
+        print(f"✓ Edge数据加载完成: {len(self.edge_data)} 样本")
+    
+    def _load_dvs_data_via_nCaltech101(self):
+        """使用NCaltech101类加载DVS数据，确保标签正确"""
+        if not os.path.exists(self.dvs_root):
+            raise FileNotFoundError(f"DVS数据目录不存在: {self.dvs_root}")
+        
+        # 检查DVS目录中的文件
+        all_files = os.listdir(self.dvs_root)
+        pt_files = [f for f in all_files if f.endswith('.pt')]
+        
+        if len(pt_files) == 0:
+            raise FileNotFoundError(f"DVS目录中没有找到.pt文件: {self.dvs_root}")
+        
+        print(f"  DVS目录: {self.dvs_root}")
+        print(f"  目录中总文件数: {len(all_files)}")
+        print(f"  .pt文件数: {len(pt_files)}")
+        
+        # 提取文件索引
+        def extract_index(filename):
+            """从文件名中提取索引，如 '0_np.pt' -> 0"""
+            try:
+                basename = filename.replace('.pt', '').replace('_np', '')
+                return int(basename)
+            except:
+                return None
+        
+        # 构建索引到文件名的映射
+        index_to_file = {}
+        for f in pt_files:
+            idx = extract_index(f)
+            if idx is not None:
+                index_to_file[idx] = f
+        
+        print(f"  有效索引范围: {min(index_to_file.keys())} - {max(index_to_file.keys())}")
+        
+        self.dvs_data = []
+        self.dvs_labels = []
+        
+        # 按索引顺序加载
+        print(f"  正在加载DVS数据...")
+        error_count = 0
+        
+        for idx in sorted(index_to_file.keys()):
+            file_path = os.path.join(self.dvs_root, index_to_file[idx])
+            try:
+                # 直接加载文件
+                data, target = torch.load(file_path, weights_only=True)
+                
+                # 处理标签
+                if isinstance(target, torch.Tensor):
+                    target = target.item() if target.numel() == 1 else target[0].item()
+                
+                # 存储数据和标签
+                self.dvs_data.append((data, file_path))
+                self.dvs_labels.append(int(target))
+                
+            except Exception as e:
+                error_count += 1
+                if error_count <= 5:  # 只显示前5个错误
+                    print(f"  警告: 无法加载DVS文件 {index_to_file[idx]}: {e}")
+                continue
+        
+        if error_count > 5:
+            print(f"  (省略了 {error_count - 5} 个错误)")
+        
+        # 统计信息
+        if len(self.dvs_labels) == 0:
+            raise ValueError(f"无法加载任何DVS数据！请检查DVS目录: {self.dvs_root}")
+        
+        unique_labels = sorted(set(self.dvs_labels))
+        print(f"✓ DVS数据加载完成: {len(self.dvs_data)} 样本")
+        print(f"  DVS标签范围: {min(self.dvs_labels)} - {max(self.dvs_labels)}")
+        print(f"  DVS唯一标签数: {len(unique_labels)}")
+    
+    def _build_category_index(self):
+        """构建类别索引：每个类别对应的样本索引"""
+        from collections import defaultdict
+        
+        self.edge_by_category = defaultdict(list)
+        self.dvs_by_category = defaultdict(list)
+        
+        for idx, label in enumerate(self.edge_labels):
+            self.edge_by_category[label].append(idx)
+        
+        for idx, label in enumerate(self.dvs_labels):
+            self.dvs_by_category[label].append(idx)
+        
+        # 找到Edge和DVS都存在的类别
+        self.common_categories = list(set(self.edge_by_category.keys()) & 
+                                      set(self.dvs_by_category.keys()))
+        self.common_categories.sort()
+        
+        print(f"✓ 共有类别数: {len(self.common_categories)}")
+        print(f"  Edge类别数: {len(self.edge_by_category)}")
+        print(f"  DVS类别数: {len(self.dvs_by_category)}")
+    
+    def __len__(self):
+        """数据集大小：以Edge数据为基准"""
+        return len(self.edge_data)
+    
+    def __getitem__(self, index):
+        """
+        获取一对category-matched的Edge和DVS样本
+        
+        Returns:
+            (edge_img, dvs_data), label
+            - edge_img: 边缘图（2通道，已预处理）
+            - dvs_data: DVS事件数据
+            - label: 类别标签
+        """
+        # 获取Edge样本
+        edge_img = self.edge_data[index]  # (2, H, W)
+        edge_label = self.edge_labels[index]
+        
+        # 在DVS数据中找同类别样本
+        if edge_label in self.dvs_by_category and len(self.dvs_by_category[edge_label]) > 0:
+            # 同类别匹配
+            dvs_indices = self.dvs_by_category[edge_label]
+            dvs_idx = dvs_indices[index % len(dvs_indices)]
+        else:
+            # 如果该类别无DVS数据，随机选择一个
+            dvs_idx = index % len(self.dvs_data)
+        
+        # 获取DVS样本
+        dvs_data, _ = self.dvs_data[dvs_idx]
+        
+        # DVS数据变换（如果需要）
+        if self.dvs_transform is not None:
+            dvs_data = self.dvs_transform(dvs_data)
+        else:
+            # 默认变换：确保格式为 (T, 2, H, W)
+            dvs_data = self._default_dvs_transform(dvs_data)
+        
+        # edge_img已经是(2, H, W)格式，不需要额外变换
+        return (edge_img, dvs_data), edge_label
+    
+    def _default_dvs_transform(self, dvs_data):
+        """默认DVS数据变换"""
+        original_shape = dvs_data.shape
+        
+        if len(original_shape) == 4:
+            if original_shape[0] == 2 and original_shape[3] >= 10:
+                # (C, H, W, T) -> (T, C, H, W)
+                dvs_data = dvs_data.permute(3, 0, 1, 2)
+            elif original_shape[1] == 2:
+                # 已经是 (T, C, H, W)
+                pass
+        
+        # 归一化到 [0, 1]
+        if dvs_data.max() > 1.0:
+            dvs_data = dvs_data / 255.0
+        
+        return dvs_data
+
+
+def get_stage1_bridge_caltech101(batch_size, train_set_ratio=1.0, dvs_train_set_ratio=1.0, 
+                                 edge_data_path=None):
+    """
+    获取Stage 1 Bridge训练数据加载器（优化版：使用预处理的edge数据）
+    
+    Args:
+        batch_size: 批次大小
+        train_set_ratio: 训练集使用比例
+        dvs_train_set_ratio: DVS训练集使用比例
+        edge_data_path: 预处理的Edge数据路径（如果为None，使用默认路径）
+    
+    返回：
+    - train_loader: category-matched的Edge和DVS数据
+    - test_loader: DVS测试数据
+    """
+    # 设置Edge数据路径
+    if edge_data_path is None:
+        edge_data_path = '/home/user/kpm/kpm/Dataset/Caltech101/caltech101_edge'
+    
+    # DVS数据路径
+    dvs_train_path = '/home/user/kpm/kpm/Dataset/Caltech101/n-caltech101/train'
+    dvs_test_path = '/home/user/kpm/kpm/Dataset/Caltech101/n-caltech101/test'
+    
+    print("正在加载Stage 1 Bridge数据集（使用预处理的Edge数据）...")
+    print(f"  Edge数据路径: {edge_data_path}")
+    print(f"  DVS数据路径: {dvs_train_path}")
+    
+    # 检查Edge数据是否存在
+    if not os.path.exists(edge_data_path):
+        raise FileNotFoundError(
+            f"\nEdge数据目录不存在: {edge_data_path}\n"
+            f"请先运行预处理脚本:\n"
+            f"  python preprocess_rgb2edge.py --output_dir {edge_data_path}\n"
+        )
+    
+    # 创建Stage1数据集
+    train_dataset = Stage1BridgeDataset(
+        edge_root=edge_data_path,
+        dvs_root=dvs_train_path,
+        train=True,
+        edge_transform=None,  # Edge数据已预处理，不需要transform
+        img_size=48
+    )
+    
+    # 测试集：使用标准DVS测试集
+    test_dataset = NCaltech101(root=dvs_test_path, train=False, transform=False)
+    
+    # 采样
+    n_train = len(train_dataset)
+    split = int(n_train * train_set_ratio)
+    indices = list(range(n_train))
+    random.shuffle(indices)
+    train_sampler = SubsetRandomSampler(indices[:split])
+    
+    # 创建DataLoader
+    train_loader = DataLoaderX(
+        dataset=train_dataset,
+        batch_size=batch_size,
+        sampler=train_sampler,
+        drop_last=True,
+        pin_memory=True
+    )
+    
+    test_loader = DataLoaderX(
+        dataset=test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+        pin_memory=True
+    )
+    
+    print(f"\n=== Stage 1 Bridge数据集 ===")
+    print(f"训练集: {len(train_dataset)} 样本 (使用 {train_set_ratio*100:.0f}%)")
+    print(f"测试集: {len(test_dataset)} 样本")
+    print(f"批次大小: {batch_size}")
+    print("===========================\n")
+    
+    return train_loader, test_loader
