@@ -171,6 +171,91 @@ class Trainer(object):
         self.network.load_state_dict(net)
 
 
+class BaselineTrainer(Trainer):
+    """
+    Baseline训练器：专门用于baseline实验
+    
+    与标准Trainer的区别：
+    1. 不使用验证集（只用训练集和测试集）
+    2. 训练过程中不在测试集上评估（避免信息泄露）
+    3. 只在训练结束后进行最终测试
+    4. 基于训练集准确率保存最佳模型
+    """
+    def __init__(self, args, device, writer, network, optimizer, criterion, scheduler, model_path):
+        super(BaselineTrainer, self).__init__(args, device, writer, network, optimizer, criterion, scheduler, model_path)
+        self.best_train_acc = 0
+
+    def train(self, train_loader, test_loader=None):
+        """
+        Baseline训练方法
+        
+        Args:
+            train_loader: 训练数据加载器
+            test_loader: 测试数据加载器（可选，仅用于最终评估）
+        """
+        for epoch in range(self.args.epoch):
+            self.network.train()
+            start = time.time()
+            train_loss = 0
+            train_num = 0
+            train_correct = 0
+
+            # 添加tqdm进度条
+            pbar = tqdm(enumerate(train_loader), total=len(train_loader), 
+                       desc=f'Epoch [{epoch+1}/{self.args.epoch}]', 
+                       leave=True)
+            
+            for i, (data, labels) in pbar:
+                self.optimizer.zero_grad()
+
+                # 若输入为rgb图片，则转换为2通道的脉冲编码，(N, 3, H, W) -> (N, T, 2, H, W)
+                if len(data.shape) == 4:
+                    data = self.encoder_dict[self.args.encoder_type](data, out_channel=2)
+
+                data, labels = data.to(self.device), labels.to(self.device)
+
+                outputs = self.network(data.float())
+                mean_out = outputs.mean(1)
+                loss = self.criterion(outputs, labels)
+
+                train_loss += loss.item()
+                loss.mean().backward()
+                self.optimizer.step()
+
+                train_num += float(labels.size(0))
+                _, predicted = mean_out.cpu().max(1)
+                train_correct += float(predicted.eq(labels.cpu()).sum().item())
+                
+                # 更新进度条信息
+                current_loss = train_loss / (i + 1)
+                current_acc = train_correct / train_num
+                pbar.set_postfix({'loss': f'{current_loss:.4f}', 'acc': f'{current_acc:.3f}'})
+            
+            pbar.close()
+            
+            self.scheduler.step()
+            train_acc = train_correct / train_num
+            train_loss = train_loss / train_num
+            
+            time_cost = (time.time() - start) / 60
+            print(f'Epoch:[{epoch}/{self.args.epoch}]\t time cost: {time_cost:.2f}min\t '
+                  f'train_loss={train_loss:.5f}\t train_acc={train_acc:.3f}')
+
+            # 记录训练指标
+            self.writer.add_scalar(tag="train/accuracy", scalar_value=train_acc, global_step=epoch)
+            self.writer.add_scalar(tag="train/lr", scalar_value=self.optimizer.param_groups[0]['lr'], global_step=epoch)
+            self.writer.add_scalar(tag="train/loss", scalar_value=train_loss, global_step=epoch)
+
+            # 保存最佳模型（基于训练集准确率）
+            if self.best_train_acc < train_acc:
+                self.best_train_acc = train_acc
+                self.save_model(epoch)
+                print(f'Saving.. Best train acc: {self.best_train_acc:.3f}')
+
+        print(f"\n训练完成！最佳训练准确率: {self.best_train_acc:.3f}")
+        return self.best_train_acc
+
+
 class TLTrainer(Trainer):
     def __init__(self, args, device, writer, network, optimizer, criterion, scheduler, model_path):
         super(TLTrainer, self).__init__(args, device, writer, network, optimizer, criterion, scheduler, model_path)

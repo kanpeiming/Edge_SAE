@@ -3,6 +3,47 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class RGB2GrayscaleModule(nn.Module):
+    """
+    RGB转灰度模块（保持3通道）
+    
+    将RGB图像转换为灰度图，但保持3通道结构（每个通道都是相同的灰度值）
+    这样可以在边缘提取前统一处理，同时保持与RGB的通道兼容性
+    
+    灰度转换公式: Gray = 0.299 * R + 0.587 * G + 0.114 * B
+    输出: (N, 3, H, W) - 三个通道的值相同
+    """
+    def __init__(self):
+        super(RGB2GrayscaleModule, self).__init__()
+        # RGB到灰度的权重 (ITU-R BT.601标准)
+        self.rgb_weights = torch.tensor([0.299, 0.587, 0.114])
+    
+    def forward(self, x):
+        """
+        Args:
+            x: RGB图像 (N, 3, H, W)
+        Returns:
+            gray: 灰度图像 (N, 3, H, W) - 三通道相同
+        """
+        if x.dim() != 4:
+            raise ValueError(f"Expected 4D input, got {x.dim()}D")
+        
+        if x.size(1) != 3:
+            # 如果不是3通道，直接返回
+            return x
+        
+        # 将权重移到输入设备上
+        weights = self.rgb_weights.to(x.device).view(1, 3, 1, 1)
+        
+        # 计算灰度值: (N, 3, H, W) -> (N, 1, H, W)
+        gray = (x * weights).sum(dim=1, keepdim=True)
+        
+        # 复制到3个通道: (N, 1, H, W) -> (N, 3, H, W)
+        gray = gray.repeat(1, 3, 1, 1)
+        
+        return gray
+
+
 class SobelEdgeExtractionModule(nn.Module):
     def __init__(self, device, in_channels=3):
         super(SobelEdgeExtractionModule, self).__init__()
@@ -343,99 +384,3 @@ class MultiThresholdCannyEdgeModule(nn.Module):
         edges = torch.cat([edges_weak, edges_medium, edges_strong], dim=1)  # (B, 3, H, W)
         
         return edges
-
-
-class EventBridgeHead(nn.Module):
-    """
-    Event Statistics Prediction Head for Stage 1 Bridge Training
-    
-    功能：从RGB-edge的backbone表示中预测DVS的事件统计信息
-    设计：轻量级1x1卷积或MLP
-    
-    输入：bottleneck特征 (N, T, 256) 或 features特征
-    输出：event density map (N, T, H, W) 或 spatial activity mask
-    """
-    
-    def __init__(self, input_dim=256, output_size=48, prediction_type='density'):
-        """
-        Args:
-            input_dim: bottleneck特征维度（默认256）
-            output_size: 输出空间尺寸（默认48，对应Caltech101）
-            prediction_type: 'density' (密度图) 或 'activity' (活动掩码)
-        """
-        super(EventBridgeHead, self).__init__()
-        self.input_dim = input_dim
-        self.output_size = output_size
-        self.prediction_type = prediction_type
-        
-        # 轻量级预测头：MLP + 上采样
-        # bottleneck (256) -> 隐藏层 (128) -> 空间特征 (H*W)
-        self.predictor = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.1),
-            nn.Linear(128, output_size * output_size),
-            nn.Sigmoid()  # 输出范围 [0, 1]
-        )
-    
-    def forward(self, bottleneck_features):
-        """
-        Args:
-            bottleneck_features: (N, T, 256) - bottleneck输出
-        
-        Returns:
-            event_stats: (N, T, 1, H, W) - 事件统计图
-        """
-        N, T, C = bottleneck_features.shape
-        
-        # 逐时间步预测
-        # (N, T, 256) -> (N*T, 256)
-        features_flat = bottleneck_features.view(N * T, C)
-        
-        # 通过预测头
-        # (N*T, 256) -> (N*T, H*W)
-        pred_flat = self.predictor(features_flat)
-        
-        # 重塑为空间形式
-        # (N*T, H*W) -> (N, T, 1, H, W)
-        event_stats = pred_flat.view(N, T, 1, self.output_size, self.output_size)
-        
-        return event_stats
-
-
-def compute_event_statistics(dvs_data, stat_type='density', target_size=None):
-    """
-    从DVS数据计算事件统计信息（ground truth）
-    
-    Args:
-        dvs_data: (N, T, 2, H, W) - DVS事件帧
-        stat_type: 'density' (事件密度) 或 'activity' (活动掩码)
-        target_size: 目标空间尺寸 (H, W)，如果提供则resize
-    
-    Returns:
-        event_stats: (N, T, 1, H_target, W_target) - 事件统计图
-    """
-    import torch.nn.functional as F
-    
-    # 简单策略：跨通道求和/平均作为事件活动强度
-    # DVS 2通道 -> 单通道密度图
-    if stat_type == 'density':
-        # 事件密度：两通道的平均
-        event_stats = dvs_data.mean(dim=2, keepdim=True)  # (N, T, 1, H, W)
-    elif stat_type == 'activity':
-        # 事件活动：二值化
-        event_stats = (dvs_data.sum(dim=2, keepdim=True) > 0).float()  # (N, T, 1, H, W)
-    else:
-        raise ValueError(f"Unknown stat_type: {stat_type}")
-    
-    # 如果指定了target_size，则resize
-    if target_size is not None:
-        N, T, C, H, W = event_stats.shape
-        # 将(N, T, 1, H, W)重塑为(N*T, 1, H, W)以便resize
-        event_stats = event_stats.view(N * T, C, H, W)
-        # Resize到目标尺寸
-        event_stats = F.interpolate(event_stats, size=target_size, mode='bilinear', align_corners=False)
-        # 重塑回(N, T, 1, H_target, W_target)
-        event_stats = event_stats.view(N, T, C, target_size[0], target_size[1])
-    
-    return event_stats

@@ -414,9 +414,13 @@ class AlignmentTLTrainer_Edge_1(TLTrainer):
                 source_data = data.to(self.device).float()  # 直接使用原始数据作为 source_data
                 target_data = data.to(self.device).float()  # 目标数据，先赋值为原始数据
 
+                # 可选：将RGB转换为灰度图（保持3通道）
+                if hasattr(self.network, 'rgb_to_gray') and self.network.rgb_to_gray is not None:
+                    target_data = self.network.rgb_to_gray(target_data)
+
                 # 对目标数据进行边缘提取
                 target_data1 = self.network.edge_extractor1(target_data)  # Sobel
-                target_data2 = self.network.edge_extractor1(target_data)  # Canny
+                target_data2 = self.network.edge_extractor1(target_data)  # Sobel
                 # 将边缘提取的图通道变为2，方便后续对DVS的迁移，DVS是两通道，这样可以不修改模型
                 target_data = torch.cat((target_data1, target_data2), dim=1)
 
@@ -603,10 +607,18 @@ class AlignmentTLTrainer_RGB2DVS(TLTrainer):
     def __init__(self, args, device, writer, network, optimizer, criterion, scheduler, model_path):
         super().__init__(args, device, writer, network, optimizer, criterion, scheduler, model_path)
         self.best_total_loss = float('inf')
-        self.best_model_path = os.path.join(model_path, "best_model.pth")
+        
+        # 兼容处理：model_path可以是目录或文件路径
+        if model_path.endswith('.pth'):
+            model_dir = os.path.dirname(model_path)
+        else:
+            model_dir = model_path
+        
+        self.best_model_path = os.path.join(model_dir, "best_model.pth")
 
     def save_model_best(self, epoch):
         """保存当前最佳模型"""
+        os.makedirs(os.path.dirname(self.best_model_path), exist_ok=True)
         torch.save({
             'epoch': epoch,
             'model_state_dict': self.network.state_dict(),
@@ -644,6 +656,11 @@ class AlignmentTLTrainer_RGB2DVS(TLTrainer):
 
                 # 解包数据: data是(rgb_img, dvs_img)的元组
                 source_data, target_data = data  # source是RGB, target是DVS
+                
+                # 解包标签: labels是(rgb_label, dvs_label)的元组
+                rgb_label, dvs_label = labels
+                # 使用RGB标签作为主标签（应该与DVS标签相同，因为是同类别配对）
+                labels = rgb_label
 
                 # 编码处理
                 # RGB数据: (N, 3, H, W) -> (N, T, 3, H, W)

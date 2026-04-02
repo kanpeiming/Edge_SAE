@@ -7,5 +7,6 @@
 """
 
 from .rgb_only_trainer import RGBOnlyTrainer
+from .edge2dvs_trainer import AlignmentTLTrainer_Edge2DVS
 
-__all__ = ['RGBOnlyTrainer']
+__all__ = ['RGBOnlyTrainer', 'AlignmentTLTrainer_Edge2DVS']

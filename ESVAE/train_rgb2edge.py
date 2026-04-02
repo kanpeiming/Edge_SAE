@@ -1,19 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-Caltech101 RGB to Edge knowledge transfer pretraining script
+RGB to Edge knowledge transfer pretraining script (Caltech101/CEP-DVS)
 RGB到边缘信息的迁移学习预训练脚本
 
 功能：
 - 使用RGB数据作为源域，RGB边缘信息作为目标域进行预训练
 - 使用Sobel+Canny双边缘提取器生成2通道边缘图
 - 保存预训练参数供后续DVS微调使用
+- 支持Caltech101和CEP-DVS两个数据集
 
 使用方法：
-1. 预训练RGB->Edge模型：
-   python train_caltech101_rgb2edge.py --epochs 50 --lr 0.001 --batch_size 32
+1. 预训练Caltech101 RGB->Edge模型：
+   python train_rgb2edge.py --data_set Caltech101 --epochs 50 --lr 0.001 --batch_size 32
 
-2. 使用预训练参数进行DVS微调：
-   python train_caltech101_baseline.py --pretrained_path /path/to/rgb_edge_pretrained_best.pth
+2. 预训练CEP-DVS RGB->Edge模型：
+   python train_rgb2edge.py --data_set CEP-DVS --epochs 50 --lr 0.001 --batch_size 32
+
+3. 使用灰度转换进行预训练（RGB先转灰度再提取边缘）：
+   python train_rgb2edge.py --data_set Caltech101 --rgb_to_gray --epochs 50 --lr 0.001 --batch_size 32
+
+4. 使用预训练参数进行DVS微调：
+   python train_edge2dvs.py --data_set Caltech101 --pretrained_path /path/to/rgb_edge_pretrained_best.pth
+   python train_edge2dvs.py --data_set CEP-DVS --pretrained_path /path/to/rgb_edge_pretrained_best.pth
 """
 
 import argparse
@@ -29,13 +37,17 @@ if esvae_root not in sys.path:
     sys.path.insert(0, esvae_root)
 
 from dataloader.caltech101 import get_caltech101
+from dataloader.cepdvs import get_cepdvs
 from pretrain.pretrainer import AlignmentTLTrainer_Edge_1
 from pretrain.pretrainModel import VGGSNN, VGGSNNwoAP
-from pretrain.Edge import SobelEdgeExtractionModule, CannyEdgeDetectionModule
+from pretrain.Edge import SobelEdgeExtractionModule, CannyEdgeDetectionModule, RGB2GrayscaleModule
 from tl_utils.loss_function import TET_loss
 from tl_utils import common_utils
 
-parser = argparse.ArgumentParser(description='Caltech101 RGB->Edge Pretraining')
+parser = argparse.ArgumentParser(description='RGB->Edge Pretraining (Caltech101/CEP-DVS)')
+parser.add_argument('--data_set', type=str, default='Caltech101', 
+                    choices=['Caltech101', 'CEP-DVS'],
+                    help='Dataset name (Caltech101 or CEP-DVS)')
 parser.add_argument('--batch_size', default=32, type=int, help='Batchsize')
 parser.add_argument('--optim', default='Adam', type=str, choices=['SGD', 'Adam'], help='Optimizer')
 parser.add_argument('--lr', default=0.001, type=float, help='Learning rate for RGB->Edge pretraining')
@@ -66,18 +78,24 @@ parser.add_argument('--checkpoint', type=str, default='/home/user/kpm/kpm/result
                     help='the path of checkpoint dir.')
 parser.add_argument('--GPU_id', type=int, default=0, help='the id of used GPU.')
 parser.add_argument('--RGB_sample_ratio', type=float, default=1.0, help='the ratio of used RGB training set.')
+parser.add_argument('--rgb_to_gray', action='store_true', default=False,
+                    help='Whether to convert RGB to grayscale before edge extraction (keeps 3 channels by repeating gray values)')
 
 args = parser.parse_args()
 
-# 固定Caltech101参数
-args.data_set = 'Caltech101'
-args.num_classes = 101
+# 根据数据集设置类别数
+if args.data_set == 'Caltech101':
+    args.num_classes = 101
+elif args.data_set == 'CEP-DVS':
+    args.num_classes = 20
+else:
+    raise ValueError(f"Unsupported dataset: {args.data_set}")
 
 device = torch.device(f"cuda:{args.GPU_id}")
 
 # 生成日志名称
 log_name = (
-    f"Caltech101_RGB2Edge_Pretrain_"
+    f"{args.data_set}_RGB2Edge_Pretrain_"
     f"{'woAP' if args.use_woap else 'AP'}_"
     f"enc-{args.encoder_type}_"
     f"opt-{args.optim}_"
@@ -85,6 +103,7 @@ log_name = (
     f"T{args.T}_"
     f"seed{args.seed}_"
     f"RGB{args.RGB_sample_ratio}_"
+    f"{'Gray_' if args.rgb_to_gray else ''}"  # 标记是否使用灰度转换
     f"TWoSobelEdge_"  # 标记使用了Sobel边缘提取器
     f"img_shape{args.img_shape}"
 )
@@ -92,14 +111,14 @@ log_name = (
 # 日志目录设置
 log_dir = os.path.join(
     args.log_dir,
-    f"Caltech101_EdgePretrain_{args.num_classes}",
+    f"{args.data_set}_EdgePretrain_{args.num_classes}",
     log_name
 )
 
 # 模型保存路径
 checkpoint_dir = os.path.join(
     args.checkpoint,
-    f"Caltech101_EdgePretrain_{args.num_classes}_{log_name}"
+    f"{args.data_set}_EdgePretrain_{args.num_classes}_{log_name}"
 )
 
 # 递归创建目录
@@ -116,26 +135,100 @@ print(f"模型保存: {model_path}")
 
 if __name__ == "__main__":
     common_utils.seed_all(args.seed)
-    f = open(f"Caltech101_{args.seed}_rgb2edge_pretrain_result.txt", "a")
+    f = open(f"{args.data_set}_{args.seed}_rgb2edge_pretrain_result.txt", "a")
 
     print("\n" + "="*80)
-    print("RGB->Edge预训练 (使用Sobel/Canny边缘检测)")
+    print(f"RGB->Edge预训练 (使用Sobel/Canny边缘检测) - {args.data_set}")
     print("="*80)
     
     # 准备RGB数据 (用于RGB->Edge预训练)
-    print("Loading Caltech101 RGB dataset for RGB->Edge pretraining...")
+    print(f"Loading {args.data_set} RGB dataset for RGB->Edge pretraining...")
     print(f"图像尺寸设置: {args.img_shape}×{args.img_shape}")
-    rgb_train_loader, rgb_test_loader = get_caltech101(
-        args.batch_size, 
-        args.RGB_sample_ratio,
-        img_size=args.img_shape
+    
+    if args.data_set == 'Caltech101':
+        # 重要：使用get_caltech101获取数据，但train和test实际是同一个数据集
+        # 我们需要手动划分train/test以避免数据泄露
+        from dataloader.caltech101 import get_caltech101
+        rgb_full_loader, _ = get_caltech101(
+            args.batch_size, 
+            train_set_ratio=1.0,  # 先加载全部数据
+            img_size=args.img_shape
+        )
+        
+        # 手动划分train/test (90% train, 10% test)
+        print(f"\n手动划分数据集（避免数据泄露）:")
+        print(f"  全部数据: {len(rgb_full_loader.dataset)} 样本")
+        
+        full_dataset = rgb_full_loader.dataset
+        dataset_size = len(full_dataset)
+        train_size = int(0.9 * dataset_size)
+        test_size = dataset_size - train_size
+        
+        # 使用固定种子确保可复现
+        torch.manual_seed(args.seed)
+        train_dataset, test_dataset = torch.utils.data.random_split(
+            full_dataset, 
+            [train_size, test_size],
+            generator=torch.Generator().manual_seed(args.seed)
+        )
+        
+        print(f"  训练集: {len(train_dataset)} 样本 (90%)")
+        print(f"  测试集: {len(test_dataset)} 样本 (10%)")
+        
+        # 根据RGB_sample_ratio进一步采样训练集
+        if args.RGB_sample_ratio < 1.0:
+            sampled_size = int(len(train_dataset) * args.RGB_sample_ratio)
+            train_indices = torch.randperm(len(train_dataset))[:sampled_size]
+            train_dataset = torch.utils.data.Subset(train_dataset, train_indices)
+            print(f"  采样后训练集: {len(train_dataset)} 样本 (ratio={args.RGB_sample_ratio})")
+        
+    elif args.data_set == 'CEP-DVS':
+        # CEP-DVS数据集
+        from dataloader.cepdvs import get_cepdvs
+        rgb_train_dataset_loader, rgb_test_dataset_loader = get_cepdvs(
+            args.batch_size, 
+            train_set_ratio=args.RGB_sample_ratio,
+            img_size=args.img_shape
+        )
+        
+        # 获取底层数据集
+        train_dataset = rgb_train_dataset_loader.dataset
+        test_dataset = rgb_test_dataset_loader.dataset
+        
+        print(f"\n数据集划分:")
+        print(f"  训练集: {len(train_dataset)} 样本")
+        print(f"  测试集: {len(test_dataset)} 样本")
+    
+    else:
+        raise ValueError(f"Unsupported dataset: {args.data_set}")
+    
+    # 创建数据加载器
+    from dataloader.dataloader_utils import DataLoaderX
+    rgb_train_loader = DataLoaderX(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=8,
+        drop_last=True,
+        pin_memory=True
+    )
+    
+    rgb_test_loader = DataLoaderX(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=8,
+        drop_last=False,
+        pin_memory=True
     )
     
     print(f"\n=== RGB->Edge预训练数据集信息 ===")
-    print(f"RGB训练集数量: {len(rgb_train_loader.dataset)}")
-    print(f"RGB测试集数量: {len(rgb_test_loader.dataset)}")
+    print(f"数据集: {args.data_set}")
+    print(f"RGB训练集数量: {len(train_dataset)}")
+    print(f"RGB测试集数量: {len(test_dataset)}")
     print(f"类别数量: {args.num_classes}")
     print(f"训练模式: RGB作为源域 -> RGB边缘信息作为目标域")
+    print(f"数据划分: 无泄露（train和test完全独立）")
     print("===========================\n")
 
     # 准备模型 - 选择标准VGGSNN模型
@@ -156,7 +249,18 @@ if __name__ == "__main__":
     model.edge_extractor1 = SobelEdgeExtractionModule(device=device, in_channels=3)
     model.edge_extractor2 = CannyEdgeDetectionModule(device=device, in_channels=3)
     
-    print("✓ 已添加双边缘提取器:")
+    # 添加灰度转换模块（如果启用）
+    if args.rgb_to_gray:
+        model.rgb_to_gray = RGB2GrayscaleModule()
+        print("✓ 已启用RGB到灰度转换:")
+        print("  - 使用ITU-R BT.601标准 (0.299*R + 0.587*G + 0.114*B)")
+        print("  - 保持3通道输出（每个通道值相同）")
+        print("  - 在边缘提取前应用")
+    else:
+        model.rgb_to_gray = None
+        print("✓ RGB到灰度转换: 未启用（直接使用RGB图像）")
+    
+    print("\n✓ 已添加双边缘提取器:")
     print("  - edge_extractor1: Sobel边缘检测 (输出1通道)")
     print("  - edge_extractor2: Canny边缘检测 (输出1通道)")
     print("  - 叠加后: 2通道边缘图，近似DVS双通道特性")
@@ -196,6 +300,7 @@ if __name__ == "__main__":
     print(f"  编码器迁移损失: {args.encoder_tl_lamb} × {args.encoder_tl_loss_type}")
     print(f"  特征迁移损失: {args.feature_tl_lamb} × {args.feature_tl_loss_type}")
     print(f"  编码器类型: {args.encoder_type}")
+    print(f"  RGB转灰度: {'启用' if args.rgb_to_gray else '未启用'}")
     print(f"  边缘提取: Sobel + Canny双算法叠加")
     
     # 使用TET损失函数
@@ -233,9 +338,11 @@ if __name__ == "__main__":
 
     # 保存结果到文件
     write_content = (
-        f'=== Caltech101 RGB->Edge预训练 结果 ===\n'
+        f'=== {args.data_set} RGB->Edge预训练 结果 ===\n'
+        f'数据集: {args.data_set}\n'
         f'种子: {args.seed}\n'
         f'边缘提取器: Sobel + Canny双算法 (2通道输出)\n'
+        f'RGB转灰度: {"启用" if args.rgb_to_gray else "未启用"}\n'
         f'模型: {"VGGSNNwoAP" if args.use_woap else "VGGSNN"}\n'
         f'预训练epochs: {args.epochs}, 学习率: {args.lr}\n'
         f'编码器迁移损失: {args.encoder_tl_lamb} × {args.encoder_tl_loss_type}\n'
@@ -250,6 +357,9 @@ if __name__ == "__main__":
     
     writer.close()
     print(f"\n预训练完成！模型已保存到: {pretrained_path}")
-    print(f"结果已记录到: Caltech101_{args.seed}_rgb2edge_pretrain_result.txt")
+    print(f"结果已记录到: {args.data_set}_{args.seed}_rgb2edge_pretrain_result.txt")
     print(f"\n使用预训练参数进行DVS微调:")
-    print(f"python train_caltech101_baseline.py --pretrained_path {pretrained_path}")
+    if args.data_set == 'Caltech101':
+        print(f"python train_caltech101_baseline.py --pretrained_path {pretrained_path}")
+    elif args.data_set == 'CEP-DVS':
+        print(f"python train_edge2dvs.py --data_set CEP-DVS --pretrained_path {pretrained_path}")

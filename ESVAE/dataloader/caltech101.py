@@ -15,57 +15,300 @@ from torch.utils.data.sampler import SubsetRandomSampler
 # your own data dir
 USER_NAME = 'zhan'
 DIR = {'Caltech101': f'/home/user/kpm/kpm/Dataset/Caltech101/caltech101/101_ObjectCategories',
-       'Caltech101DVS': f'/home/user/kpm/kpm/Dataset/Caltech101/n-caltech101',
+       'Caltech101DVS': f'/home/user/kpm/kpm/Dataset/Caltech101/NCALTECH101/NCALTECH101/Caltech101',
        'Caltech101DVS_CATCH': f'/data/{USER_NAME}/Event_Camera_Datasets/Caltech101/NCaltech101_dst_cache'
        }
 
 
-def get_tl_caltech101(batch_size, train_set_ratio=1.0, dvs_train_set_ratio=1.0):
+def get_tl_caltech101(batch_size, train_set_ratio=1.0, dvs_train_set_ratio=1.0, 
+                      num_workers=8, img_size=48, split_ratio=0.9):
     """
-    get the train loader which yield rgb_img and dvs_img with label
-    and test loader which yield dvs_img with label of caltech101.
+    获取RGB到DVS迁移学习的数据加载器（现代版本）
     
-    N-Caltech101标准: 保留BACKGROUND_Google，移除Faces类
+    N-Caltech101标准: 保留BACKGROUND_Google，移除Faces/Faces_easy类
     最终101类 = 100个物体类 + 1个背景类(BACKGROUND_Google)
     
-    :return: train_loader, test_loader
+    重要修复:
+    1. 使用自定义collate_fn处理RGB(3,H,W)和DVS(T,C,H,W)不同形状的批处理
+    2. 过滤Faces/Faces_easy类并重新映射标签到[0,100]范围
+    3. 确保RGB和DVS数据集的类别和标签一致
+    
+    Args:
+        batch_size: 批次大小
+        train_set_ratio: RGB训练集使用比例
+        dvs_train_set_ratio: DVS训练集使用比例
+        num_workers: 数据加载线程数
+        img_size: 图像尺寸
+        split_ratio: DVS数据自动划分比例（如果没有train/test目录）
+    
+    Returns:
+        train_loader: 训练数据加载器（返回RGB和DVS配对）
+        test_loader: 测试数据加载器（仅DVS）
     """
+    import random
+    from torch.utils.data.sampler import SubsetRandomSampler
+    
+    print("\n加载Caltech101 RGB到DVS迁移学习数据集...")
+    
+    # 1. 加载RGB数据集（自动过滤Faces类）
+    print("  加载RGB数据...")
     rgb_trans_train = transforms.Compose([
-                                          transforms.Resize((48, 48)),  # resize
-                                          # transforms.RandomCrop(48, padding=2),  # 随机裁剪到48x48
-                                          # transforms.RandomHorizontalFlip(p=0.5), # 概率50%水平翻转
-                                          # transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1), # 随机的颜色调整
-                                          transforms.ToTensor(),
-                                          transforms.Normalize((0.5429, 0.5263, 0.4994), (0.2422, 0.2392, 0.2406)),  # 归一化
-                                      ])
-    # rgb_trans_test = transforms.Compose([transforms.Resize(48, 48),
-    #                                      transforms.ToTensor(),
-    #                                      #transforms.Lambda(lambda x: x.repeat(3,1,1)),
-    #                                      transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
-    #                                      ])
-    dvs_trans = transforms.Compose([transforms.Resize((48, 48)),
-                                    # transforms.RandomCrop(48, padding=4),
-                                    # transforms.RandomHorizontalFlip(),  # 随机水平翻转
-                                    transforms.ToTensor(),
-                                   ])
-
-    tl_train_data = TLCaltech101(DIR['Caltech101'], DIR['Caltech101DVS'], train=True, dvs_train_set_ratio=dvs_train_set_ratio,
-                                 transform=rgb_trans_train, dvs_transform=dvs_trans, download=False)
-    dvs_test_data = TLCaltech101(DIR['Caltech101'], DIR['Caltech101DVS'], train=False, dvs_train_set_ratio=1.0,
-                                 dvs_transform=dvs_trans, download=False)
-
-    # take train set by train_set_ratio
+        transforms.Resize((img_size, img_size)),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5429, 0.5263, 0.4994), (0.2422, 0.2392, 0.2406)),
+    ])
+    
+    try:
+        # 尝试使用Caltech101数据集
+        caltech101_root = os.path.dirname(DIR['Caltech101'])
+        rgb_dataset = datasets.Caltech101(caltech101_root, transform=rgb_trans_train, download=False)
+        categories = rgb_dataset.categories
+        
+        # N-Caltech101标准：移除Faces类
+        if 'Faces' in categories:
+            faces_idx = categories.index('Faces')
+            # 过滤掉Faces类的样本
+            from torch.utils.data import Subset
+            indices = [i for i, (_, label) in enumerate(rgb_dataset) if label != faces_idx]
+            rgb_dataset = Subset(rgb_dataset, indices)
+            print(f"  ✓ RGB: 移除Faces类，保留{len(categories)-1}类，{len(rgb_dataset)}样本")
+        else:
+            print(f"  ✓ RGB: {len(categories)}类，{len(rgb_dataset)}样本")
+            
+    except Exception as e:
+        # 回退到ImageFolder
+        rgb_dataset_raw = datasets.ImageFolder(DIR['Caltech101'], transform=rgb_trans_train)
+        
+        # N-Caltech101标准：保留BACKGROUND_Google，只移除Faces类（与Edge→DVS保持一致）
+        # 最终应该是101类（100个物体类 + 1个BACKGROUND_Google）
+        classes_to_remove = ['Faces']
+        
+        # 找出需要保留的类别并按名称排序（与DVS数据集保持一致）
+        valid_classes = sorted([cls for cls in rgb_dataset_raw.classes if cls not in classes_to_remove])
+        
+        # 过滤样本并重新映射标签
+        from torch.utils.data import Subset
+        valid_indices = []
+        label_mapping = {}  # 旧标签 -> 新标签
+        
+        # 按类别名称排序后重新分配标签（与DVS的sorted(subdirs)保持一致）
+        for new_idx, class_name in enumerate(valid_classes):
+            old_idx = rgb_dataset_raw.class_to_idx[class_name]
+            label_mapping[old_idx] = new_idx
+        
+        for idx, (path, label) in enumerate(rgb_dataset_raw.samples):
+            if label in label_mapping:
+                valid_indices.append(idx)
+        
+        # 创建包装类来重新映射标签
+        class RemappedDataset(torch.utils.data.Dataset):
+            def __init__(self, dataset, indices, label_mapping):
+                self.dataset = dataset
+                self.indices = indices
+                self.label_mapping = label_mapping
+            
+            def __len__(self):
+                return len(self.indices)
+            
+            def __getitem__(self, idx):
+                real_idx = self.indices[idx]
+                img, old_label = self.dataset[real_idx]
+                new_label = self.label_mapping[old_label]
+                return img, new_label
+        
+        rgb_dataset = RemappedDataset(rgb_dataset_raw, valid_indices, label_mapping)
+        print(f"  ✓ RGB (ImageFolder): 移除Faces类，保留{len(valid_classes)}类（含BACKGROUND_Google），{len(rgb_dataset)}样本")
+        print(f"  RGB标签映射: 按类别名称排序，标签范围 [0, {len(valid_classes)-1}]")
+    
+    # RGB采样
     if train_set_ratio < 1.0:
-        n_train = len(tl_train_data)  # 60000
-        split = int(n_train * train_set_ratio)  # 60000*0.9 = 54000
-        tl_train_data, _ = random_split(tl_train_data, [split, n_train-split], generator=torch.Generator().manual_seed(1000))
-
-    train_dataloader = DataLoaderX(tl_train_data, batch_size=batch_size, shuffle=True, num_workers=8, drop_last=True,
-                                   pin_memory=True)
-    test_dataloader = DataLoaderX(dvs_test_data, batch_size=batch_size, shuffle=False, num_workers=8, drop_last=False,
-                                  pin_memory=True)
-
-    return train_dataloader, test_dataloader
+        n_rgb = len(rgb_dataset)
+        rgb_indices = list(range(n_rgb))
+        random.shuffle(rgb_indices)
+        rgb_dataset = Subset(rgb_dataset, rgb_indices[:int(n_rgb * train_set_ratio)])
+        print(f"  采样后RGB: {len(rgb_dataset)}样本")
+    
+    # 2. 加载DVS数据集（使用NCaltech101Dataset，参考baseline）
+    print("  加载DVS数据...")
+    dvs_root = DIR['Caltech101DVS']
+    train_path = os.path.join(dvs_root, 'train')
+    test_path = os.path.join(dvs_root, 'test')
+    
+    has_split = os.path.exists(train_path) and os.path.exists(test_path)
+    
+    if has_split:
+        # 使用预先划分的train/test
+        # 注意：DVS数据不过滤Faces类，保持原始101类结构
+        dvs_train_dataset = NCaltech101Dataset(train_path, transform=True, img_size=img_size,
+                                               use_nda=False, use_eventrpg=False, filter_faces=False)
+        dvs_test_dataset = NCaltech101Dataset(test_path, transform=False, img_size=img_size,
+                                              use_nda=False, use_eventrpg=False, filter_faces=False)
+        print(f"  ✓ DVS训练集: {len(dvs_train_dataset)}样本")
+        print(f"  ✓ DVS测试集: {len(dvs_test_dataset)}样本")
+        
+        # DVS训练集采样
+        if dvs_train_set_ratio < 1.0:
+            n_dvs = len(dvs_train_dataset)
+            dvs_indices = list(range(n_dvs))
+            random.shuffle(dvs_indices)
+            dvs_train_indices = dvs_indices[:int(n_dvs * dvs_train_set_ratio)]
+            # 创建采样后的子集
+            from torch.utils.data import Subset
+            dvs_train_dataset = Subset(dvs_train_dataset, dvs_train_indices)
+            print(f"  采样后DVS训练集: {len(dvs_train_dataset)}样本")
+    else:
+        # 自动划分train/test
+        print(f"  未找到train/test划分，自动划分（{split_ratio*100:.0f}%训练，{(1-split_ratio)*100:.0f}%测试）")
+        # 注意：DVS数据不过滤Faces类，保持原始101类结构
+        full_dataset = NCaltech101Dataset(dvs_root, transform=False, img_size=img_size,
+                                         use_nda=False, use_eventrpg=False, filter_faces=False)
+        
+        # 按类别划分
+        if hasattr(full_dataset, 'file_labels') and full_dataset.file_labels is not None:
+            from collections import defaultdict
+            samples_by_class = defaultdict(list)
+            for idx, label in enumerate(full_dataset.file_labels):
+                samples_by_class[label].append(idx)
+            
+            train_indices = []
+            test_indices = []
+            
+            for label, indices in samples_by_class.items():
+                random.shuffle(indices)
+                split_point = int(len(indices) * split_ratio)
+                train_indices.extend(indices[:split_point])
+                test_indices.extend(indices[split_point:])
+            
+            random.shuffle(train_indices)
+            random.shuffle(test_indices)
+        else:
+            all_indices = list(range(len(full_dataset)))
+            random.shuffle(all_indices)
+            split_point = int(len(all_indices) * split_ratio)
+            train_indices = all_indices[:split_point]
+            test_indices = all_indices[split_point:]
+        
+        # DVS采样
+        if dvs_train_set_ratio < 1.0:
+            n_use = int(len(train_indices) * dvs_train_set_ratio)
+            train_indices = train_indices[:n_use]
+        
+        print(f"  ✓ DVS训练集: {len(train_indices)}样本")
+        print(f"  ✓ DVS测试集: {len(test_indices)}样本")
+        
+        # 创建数据集
+        # 注意：DVS数据不过滤Faces类，保持原始101类结构
+        dvs_train_dataset = NCaltech101Dataset(dvs_root, transform=True, img_size=img_size,
+                                               use_nda=False, use_eventrpg=False, filter_faces=False)
+        dvs_test_dataset = NCaltech101Dataset(dvs_root, transform=False, img_size=img_size,
+                                              use_nda=False, use_eventrpg=False, filter_faces=False)
+        
+        # 应用采样器
+        from torch.utils.data import Subset
+        dvs_train_dataset = Subset(dvs_train_dataset, train_indices)
+        dvs_test_dataset = Subset(dvs_test_dataset, test_indices)
+    
+    # 3. 创建RGB2DVS训练数据集（使用与Edge2DVS相同的配对方式）
+    class TLRGB2DVSDataset(Dataset):
+        """RGB到DVS迁移学习数据集 - 使用取模配对（与Edge2DVS一致）"""
+        def __init__(self, rgb_dataset, dvs_dataset):
+            self.rgb_dataset = rgb_dataset
+            self.dvs_dataset = dvs_dataset
+        
+        def __len__(self):
+            return max(len(self.rgb_dataset), len(self.dvs_dataset))
+        
+        def __getitem__(self, index):
+            # RGB数据 - 使用取模循环
+            rgb_idx = index % len(self.rgb_dataset)
+            rgb_data, rgb_label = self.rgb_dataset[rgb_idx]
+            
+            # DVS数据 - 使用取模循环
+            dvs_idx = index % len(self.dvs_dataset)
+            dvs_data, dvs_label = self.dvs_dataset[dvs_idx]
+            
+            return (rgb_data, dvs_data), (rgb_label, dvs_label)
+        
+        def get_len(self):
+            return [len(self.rgb_dataset), len(self.dvs_dataset)]
+    
+    train_dataset = TLRGB2DVSDataset(rgb_dataset, dvs_train_dataset)
+    
+    # 自定义collate函数，处理RGB和DVS数据的批处理
+    def tl_collate_fn(batch):
+        """
+        自定义collate函数，处理RGB-DVS配对数据
+        batch: list of ((rgb_data, dvs_data), (rgb_label, dvs_label))
+        返回格式与Edge2DVS一致：((rgb_batch, dvs_batch), (rgb_labels, dvs_labels))
+        """
+        rgb_batch = []
+        dvs_batch = []
+        rgb_label_batch = []
+        dvs_label_batch = []
+        
+        for (rgb_data, dvs_data), (rgb_label, dvs_label) in batch:
+            rgb_batch.append(rgb_data)
+            dvs_batch.append(dvs_data)
+            
+            # 处理RGB标签
+            if isinstance(rgb_label, torch.Tensor):
+                rgb_label_batch.append(rgb_label.item() if rgb_label.numel() == 1 else rgb_label)
+            else:
+                rgb_label_batch.append(rgb_label)
+            
+            # 处理DVS标签
+            if isinstance(dvs_label, torch.Tensor):
+                dvs_label_batch.append(dvs_label.item() if dvs_label.numel() == 1 else dvs_label)
+            else:
+                dvs_label_batch.append(dvs_label)
+        
+        # 堆叠成batch
+        rgb_batch = torch.stack(rgb_batch, dim=0)  # (B, 3, H, W)
+        dvs_batch = torch.stack(dvs_batch, dim=0)  # (B, T, C, H, W)
+        
+        # 处理RGB标签
+        if isinstance(rgb_label_batch[0], torch.Tensor) and rgb_label_batch[0].numel() > 1:
+            rgb_label_batch = torch.stack(rgb_label_batch, dim=0)
+        else:
+            rgb_label_batch = torch.tensor(rgb_label_batch)  # (B,)
+        
+        # 处理DVS标签
+        if isinstance(dvs_label_batch[0], torch.Tensor) and dvs_label_batch[0].numel() > 1:
+            dvs_label_batch = torch.stack(dvs_label_batch, dim=0)
+        else:
+            dvs_label_batch = torch.tensor(dvs_label_batch)  # (B,)
+        
+        return (rgb_batch, dvs_batch), (rgb_label_batch, dvs_label_batch)
+    
+    # 4. 创建数据加载器
+    train_loader = DataLoaderX(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        drop_last=True,
+        pin_memory=True,
+        collate_fn=tl_collate_fn
+    )
+    
+    test_loader = DataLoaderX(
+        dvs_test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        drop_last=False,
+        pin_memory=True
+    )
+    
+    # 显示配对信息
+    print(f"\n最终数据集配对:")
+    print(f"  RGB样本: {train_dataset.get_len()[0]}")
+    print(f"  DVS样本: {train_dataset.get_len()[1]}")
+    if train_dataset.get_len()[0] != train_dataset.get_len()[1]:
+        print(f"  ⚠️  样本数不一致，训练时使用循环采样（取模）策略")
+    print()
+    
+    return train_loader, test_loader
 
 
 def get_caltech101(batch_size, train_set_ratio=1.0, img_size=48):
@@ -352,7 +595,7 @@ def get_n_caltech101(batch_size,T,split_ratio=0.9,train_set_ratio=1.0,size=224,e
     # generate dataloader
     # train_data_loader = DataLoaderX(dataset=train_set, batch_size=batch_size, shuffle=True, drop_last=True,
     #                                 num_workers=8, pin_memory=True)
-    train_data_loader = DataLoaderX(dataset=train_set, batch_size=batch_size, shuffle=False, drop_last=True,
+    train_data_loader = DataLoaderX(dataset=train_set, batch_size=batch_size, shuffle=False, drop_last=False,
                                     sampler=train_sampler, num_workers=8,
                                     pin_memory=True)  # SubsetRandomSampler 自带shuffle，不能重复使用
     test_data_loader = DataLoaderX(dataset=test_set, batch_size=batch_size, shuffle=False, drop_last=False,
@@ -387,12 +630,16 @@ class NCaltech101(Dataset):
             tuple: (image, target) where target is index of the target class.
         """
         data, target = torch.load(self.root + '/{}_np.pt'.format(index))
-        # if self.train:
-        new_data = []
-        for t in range(data.size(0)):
-            new_data.append(self.tensorx(self.resize(self.imgx(data[t, ...]))))
         
-        data = torch.stack(new_data, dim=0)
+        # 优化：批量resize，避免Tensor→PIL→Tensor转换
+        # 直接使用torch.nn.functional.interpolate一次性处理所有时间步
+        if data.shape[2] != 48 or data.shape[3] != 48:
+            data = torch.nn.functional.interpolate(
+                data.float(),  # (T, C, H, W)
+                size=(48, 48),
+                mode='bilinear',
+                align_corners=False
+            )
         
         if self.transform:
             if self.use_eventrpg:
@@ -736,7 +983,8 @@ class NCaltech101Dataset(Dataset):
     优化的N-Caltech101数据集类
     支持灵活的文件命名格式和数据增强
     """
-    def __init__(self, root, transform=True, img_size=224, use_nda=False, use_eventrpg=False, eventrpg_mix_prob=0.5):
+    def __init__(self, root, transform=True, img_size=224, use_nda=False, use_eventrpg=False, eventrpg_mix_prob=0.5, 
+                 filter_faces=False):
         """
         Args:
             root: 数据根目录
@@ -745,12 +993,14 @@ class NCaltech101Dataset(Dataset):
             use_nda: 是否使用NDA_SNN的数据增强方法
             use_eventrpg: 是否使用EventRPG的数据增强方法
             eventrpg_mix_prob: EventRPG的RPGMix概率
+            filter_faces: 是否过滤Faces/Faces_easy类（用于RGB2DVS迁移学习）
         """
         self.root = os.path.expanduser(root)
         self.transform = transform
         self.img_size = img_size
         self.use_nda = use_nda
         self.use_eventrpg = use_eventrpg
+        self.filter_faces = filter_faces
         self.resize = transforms.Resize(size=(img_size, img_size))
         self.to_tensor = transforms.ToTensor()
         self.to_pil = transforms.ToPILImage()
@@ -769,25 +1019,183 @@ class NCaltech101Dataset(Dataset):
             self.eventrpg_augment = EventRPGAugment(img_size=img_size, mix_prob=eventrpg_mix_prob)
 
     def _build_file_list(self):
-        """构建并排序文件列表"""
+        """构建并排序文件列表（支持.pt和.bin格式）"""
         if not os.path.exists(self.root):
             return []
         
-        files = [f for f in os.listdir(self.root) if f.endswith('.pt')]
+        # 检查是否为类别目录结构（如 /wild_cat/image_0016.bin）
+        subdirs = [d for d in os.listdir(self.root) 
+                   if os.path.isdir(os.path.join(self.root, d))]
         
-        # 智能排序：提取数字部分
-        def extract_number(filename):
-            basename = filename.split('.')[0].replace('_np', '')
-            try:
-                return int(basename)
-            except ValueError:
-                return 0
-        
-        return sorted(files, key=extract_number)
+        if subdirs:
+            # 类别目录结构：遍历所有类别目录
+            print(f"检测到类别目录结构，共 {len(subdirs)} 个类别")
+            
+            # 如果需要过滤Faces类
+            if self.filter_faces:
+                original_count = len(subdirs)
+                subdirs = [d for d in subdirs if d.lower() not in ['faces', 'faces_easy']]
+                filtered_count = original_count - len(subdirs)
+                if filtered_count > 0:
+                    print(f"  过滤掉 {filtered_count} 个Faces类（N-Caltech101标准）")
+            
+            files = []
+            self.category_labels = {}  # 类别名到标签的映射
+            self.file_labels = []  # 每个文件对应的标签
+            
+            # 对类别目录排序以确保一致的标签分配
+            subdirs = sorted(subdirs)
+            
+            for label_idx, category_dir in enumerate(subdirs):
+                self.category_labels[category_dir] = label_idx
+                category_path = os.path.join(self.root, category_dir)
+                
+                # 查找该类别下的所有.bin或.pt文件
+                category_files = [f for f in os.listdir(category_path) 
+                                if f.endswith('.bin') or f.endswith('.pt')]
+                
+                for f in sorted(category_files):
+                    files.append(os.path.join(category_dir, f))
+                    self.file_labels.append(label_idx)
+            
+            print(f"从类别目录加载了 {len(files)} 个文件")
+            if self.filter_faces and self.file_labels:
+                print(f"  标签范围: [0, {max(self.file_labels)}]，共 {len(set(self.file_labels))} 个类别")
+            return files
+        else:
+            # 扁平目录结构：直接在root下查找.pt文件
+            files = [f for f in os.listdir(self.root) if f.endswith('.pt')]
+            self.file_labels = None  # 标签从文件内容中读取
+            
+            # 智能排序：提取数字部分
+            def extract_number(filename):
+                basename = filename.split('.')[0].replace('_np', '')
+                try:
+                    return int(basename)
+                except ValueError:
+                    return 0
+            
+            return sorted(files, key=extract_number)
 
+    def _load_bin_file(self, file_path):
+        """
+        加载.bin格式的事件数据
+        N-Caltech101 .bin文件格式（官方标准）：每个事件占40 bits (5 bytes)
+        
+        Bit layout (40 bits):
+        - bit 39-32: X address (8 bits, 0-255 pixels)
+        - bit 31-24: Y address (8 bits, 0-255 pixels)
+        - bit 23:    Polarity (1 bit, 0 for OFF, 1 for ON)
+        - bit 22-0:  Timestamp (23 bits, in microseconds)
+        
+        Byte layout (5 bytes):
+        - byte 0:    X address (8 bits)
+        - byte 1:    Y address (8 bits)
+        - byte 2:    Polarity (bit 7) + Timestamp[22:16] (bits 6-0)
+        - byte 3:    Timestamp[15:8]
+        - byte 4:    Timestamp[7:0]
+        """
+        import numpy as np
+        
+        # 读取二进制数据
+        with open(file_path, 'rb') as f:
+            raw_data = np.fromfile(f, dtype=np.uint8)
+        
+        # 检查数据长度是否为5的倍数
+        if len(raw_data) % 5 != 0:
+            print(f"警告: {file_path} 的大小 ({len(raw_data)} bytes) 不是5的倍数，可能存在损坏")
+            raw_data = raw_data[:-(len(raw_data) % 5)]  # 截断到5的倍数
+        
+        num_events = len(raw_data) // 5
+        
+        if num_events == 0:
+            print(f"警告: {file_path} 没有有效事件数据")
+            # 返回空的事件帧
+            return torch.zeros(10, 2, 180, 240, dtype=torch.float32)
+        
+        # 重塑为 (num_events, 5) 数组
+        events = raw_data.reshape(-1, 5)
+        
+        # 解析坐标（8位，0-255）
+        x = events[:, 0].astype(np.int32)  # X address (byte 0)
+        y = events[:, 1].astype(np.int32)  # Y address (byte 1)
+        
+        # 解析极性和时间戳
+        # byte 2: [polarity(1bit) | timestamp[22:16](7bits)]
+        polarity = (events[:, 2] >> 7) & 1  # 取最高位作为极性
+        
+        # 重建23位时间戳
+        # timestamp = byte2[6:0] << 16 | byte3 << 8 | byte4
+        timestamp = (
+            ((events[:, 2] & 0x7F).astype(np.int32) << 16) |  # 低7位左移16位
+            (events[:, 3].astype(np.int32) << 8) |            # byte 3左移8位
+            events[:, 4].astype(np.int32)                      # byte 4
+        )
+        
+        # N-Caltech101 的分辨率是 240x180（宽x高）
+        H_orig, W_orig = 180, 240
+        T = 10  # 时间步数
+        
+        # 创建帧缓冲区 (T, C=2, H, W)
+        frames = np.zeros((T, 2, H_orig, W_orig), dtype=np.float32)
+        
+        # 将时间戳归一化到[0, T-1]
+        t_min, t_max = timestamp.min(), timestamp.max()
+        if t_max > t_min:
+            t_normalized = ((timestamp - t_min) / (t_max - t_min) * (T - 1)).astype(np.int32)
+            t_normalized = np.clip(t_normalized, 0, T - 1)
+        else:
+            # 所有事件时间戳相同，放在第一帧
+            t_normalized = np.zeros(num_events, dtype=np.int32)
+        
+        # 过滤无效坐标（超出分辨率范围的事件）
+        valid_mask = (x >= 0) & (x < W_orig) & (y >= 0) & (y < H_orig)
+        x = x[valid_mask]
+        y = y[valid_mask]
+        polarity = polarity[valid_mask]
+        t_normalized = t_normalized[valid_mask]
+        
+        # 将事件累积到对应的帧和通道中
+        # 使用向量化操作提高效率
+        for t_idx in range(T):
+            mask_t = (t_normalized == t_idx)
+            if mask_t.any():
+                x_t = x[mask_t]
+                y_t = y[mask_t]
+                pol_t = polarity[mask_t]
+                
+                # 分别累积正极性和负极性事件
+                for pol in [0, 1]:
+                    mask_pol = (pol_t == pol)
+                    if mask_pol.any():
+                        x_pol = x_t[mask_pol]
+                        y_pol = y_t[mask_pol]
+                        # 累积事件计数
+                        np.add.at(frames[t_idx, pol], (y_pol, x_pol), 1.0)
+        
+        # 转换为torch tensor
+        data = torch.from_numpy(frames).float()
+        
+        return data
+    
     def __getitem__(self, index):
         file_path = os.path.join(self.root, self.files[index])
-        data, target = torch.load(file_path, weights_only=True)
+        
+        # 根据文件扩展名选择加载方法
+        if file_path.endswith('.bin'):
+            # 加载.bin文件
+            data = self._load_bin_file(file_path)
+            
+            # 如果使用类别目录结构，从file_labels获取标签
+            if self.file_labels is not None:
+                target = torch.tensor(self.file_labels[index])
+            else:
+                # 尝试从文件名推断类别（不推荐）
+                print(f"警告: .bin文件缺少标签信息，使用默认标签0")
+                target = torch.tensor(0)
+        else:
+            # 加载.pt文件
+            data, target = torch.load(file_path, weights_only=True)
         
         # 调试信息：打印数据形状
         if index == 0:  # 只在第一个样本时打印
@@ -812,18 +1220,13 @@ class NCaltech101Dataset(Dataset):
             
             # 检查通道数是否合理
             if C <= 4:  # 正常的图像通道数
-                processed_data = []
-                for t in range(T):
-                    frame = data[t]  # (C, H, W)
-                    # 直接resize，不需要转换为PIL
-                    frame_resized = torch.nn.functional.interpolate(
-                        frame.unsqueeze(0), 
+                # 优化：批量resize所有时间步，避免逐帧处理
+                data = torch.nn.functional.interpolate(
+                    data,  # (T, C, H, W)
                         size=(self.img_size, self.img_size), 
                         mode='bilinear', 
                         align_corners=False
-                    ).squeeze(0)
-                    processed_data.append(frame_resized)
-                data = torch.stack(processed_data, dim=0)
+                )
             else:
                 # 可能是错误的维度排列，尝试重新整形
                 if index == 0:
@@ -842,17 +1245,13 @@ class NCaltech101Dataset(Dataset):
                     if index == 0:
                         print(f"Reshaped to: {data.shape}")
                     
-                    # 然后resize到目标尺寸
-                    processed_data = []
-                    for t in range(T_target):
-                        frame_resized = torch.nn.functional.interpolate(
-                            data[t].unsqueeze(0), 
+                    # 优化：批量resize所有时间步
+                    data = torch.nn.functional.interpolate(
+                        data,  # (T, C, H, W)
                             size=(self.img_size, self.img_size), 
                             mode='bilinear', 
                             align_corners=False
-                        ).squeeze(0)
-                        processed_data.append(frame_resized)
-                    data = torch.stack(processed_data, dim=0)
+                    )
                 except:
                     # 如果重新整形失败，创建默认数据
                     if index == 0:
@@ -903,12 +1302,12 @@ class NCaltech101Dataset(Dataset):
         return len(self.files)
 
 
-def create_caltech101_dataloaders(data_path, batch_size, train_ratio=1.0, num_workers=8, img_size=224, use_nda=False, use_eventrpg=False, eventrpg_mix_prob=0.5):
+def create_caltech101_dataloaders(data_path, batch_size, train_ratio=1.0, num_workers=8, img_size=224, use_nda=False, use_eventrpg=False, eventrpg_mix_prob=0.5, split_ratio=0.9):
     """
     创建N-Caltech101数据加载器
     
     Args:
-        data_path: 数据集根路径（包含train和test文件夹）
+        data_path: 数据集根路径（包含train和test文件夹，或类别目录）
         batch_size: 批次大小
         train_ratio: 训练集使用比例
         num_workers: 数据加载线程数
@@ -916,6 +1315,7 @@ def create_caltech101_dataloaders(data_path, batch_size, train_ratio=1.0, num_wo
         use_nda: 是否使用NDA_SNN的数据增强方法
         use_eventrpg: 是否使用EventRPG的数据增强方法
         eventrpg_mix_prob: EventRPG的RPGMix概率
+        split_ratio: 当没有train/test划分时，自动划分的训练集比例（默认0.9）
     
     Returns:
         train_loader, test_loader
@@ -926,29 +1326,79 @@ def create_caltech101_dataloaders(data_path, batch_size, train_ratio=1.0, num_wo
     train_path = os.path.join(data_path, 'train')
     test_path = os.path.join(data_path, 'test')
     
-    # 验证路径
-    if not (os.path.exists(train_path) and os.path.exists(test_path)):
-        raise FileNotFoundError(f"train/test directories not found in {data_path}")
+    # 检查是否存在train/test划分
+    has_split = os.path.exists(train_path) and os.path.exists(test_path)
     
-    # 创建数据集
-    train_dataset = NCaltech101Dataset(train_path, transform=True, img_size=img_size, use_nda=use_nda, use_eventrpg=use_eventrpg, eventrpg_mix_prob=eventrpg_mix_prob)
-    test_dataset = NCaltech101Dataset(test_path, transform=False, img_size=img_size, use_nda=False, use_eventrpg=False)
-    
-    print(f"Dataset loaded: {len(train_dataset)} train, {len(test_dataset)} test samples")
-    
-    # 训练集采样
-    if train_ratio < 1.0:
-        n_train = len(train_dataset)
-        indices = list(range(n_train))
-        random.shuffle(indices)
-        train_indices = indices[:int(n_train * train_ratio)]
-        train_sampler = SubsetRandomSampler(train_indices)
-        shuffle = False
+    if has_split:
+        # 使用预先划分的train/test
+        train_dataset = NCaltech101Dataset(train_path, transform=True, img_size=img_size, use_nda=use_nda, use_eventrpg=use_eventrpg, eventrpg_mix_prob=eventrpg_mix_prob)
+        test_dataset = NCaltech101Dataset(test_path, transform=False, img_size=img_size, use_nda=False, use_eventrpg=False)
+        
+        print(f"Dataset loaded: {len(train_dataset)} train, {len(test_dataset)} test samples")
+        
+        # 训练集采样
+        if train_ratio < 1.0:
+            n_train = len(train_dataset)
+            indices = list(range(n_train))
+            random.shuffle(indices)
+            train_indices = indices[:int(n_train * train_ratio)]
+            train_sampler = SubsetRandomSampler(train_indices)
+            shuffle = False
+        else:
+            train_sampler = None
+            shuffle = True
+        
+        test_sampler = None
     else:
-        train_sampler = None
-        shuffle = True
+        # 没有train/test划分，自动划分
+        print(f"No train/test split found, auto-splitting with ratio {split_ratio}")
+        
+        # 加载整个数据集
+        full_dataset = NCaltech101Dataset(data_path, transform=False, img_size=img_size, use_nda=False, use_eventrpg=False)
+        
+        # 按类别划分
+        if hasattr(full_dataset, 'file_labels') and full_dataset.file_labels is not None:
+            from collections import defaultdict
+            samples_by_class = defaultdict(list)
+            for idx, label in enumerate(full_dataset.file_labels):
+                samples_by_class[label].append(idx)
+            
+            train_indices = []
+            test_indices = []
+            
+            for label, indices in samples_by_class.items():
+                random.shuffle(indices)
+                split_point = int(len(indices) * split_ratio)
+                train_indices.extend(indices[:split_point])
+                test_indices.extend(indices[split_point:])
+            
+            random.shuffle(train_indices)
+            random.shuffle(test_indices)
+        else:
+            # 没有类别信息，按顺序划分
+            all_indices = list(range(len(full_dataset)))
+            random.shuffle(all_indices)
+            split_point = int(len(all_indices) * split_ratio)
+            train_indices = all_indices[:split_point]
+            test_indices = all_indices[split_point:]
+        
+        print(f"Dataset loaded: {len(train_indices)} train, {len(test_indices)} test samples")
+        
+        # 创建带数据增强的训练集和不带数据增强的测试集
+        train_dataset = NCaltech101Dataset(data_path, transform=True, img_size=img_size, use_nda=use_nda, use_eventrpg=use_eventrpg, eventrpg_mix_prob=eventrpg_mix_prob)
+        test_dataset = NCaltech101Dataset(data_path, transform=False, img_size=img_size, use_nda=False, use_eventrpg=False)
+        
+        # 使用采样器
+        if train_ratio < 1.0:
+            n_use = int(len(train_indices) * train_ratio)
+            train_indices = train_indices[:n_use]
+        
+        train_sampler = SubsetRandomSampler(train_indices)
+        test_sampler = SubsetRandomSampler(test_indices)
+        shuffle = False
     
     # 创建数据加载器
+    # 优化配置：添加prefetch_factor和persistent_workers以减少数据加载停顿
     train_loader = DataLoaderX(
         train_dataset,
         batch_size=batch_size,
@@ -956,336 +1406,320 @@ def create_caltech101_dataloaders(data_path, batch_size, train_ratio=1.0, num_wo
         sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=True,
-        drop_last=True
+        drop_last=True,
+        prefetch_factor=4,  # 每个worker预取4个batch，减少等待时间
+        persistent_workers=True if num_workers > 0 else False  # 保持worker进程，避免重复创建
     )
     
     test_loader = DataLoaderX(
         test_dataset,
         batch_size=batch_size,
         shuffle=False,
+        sampler=test_sampler,
         num_workers=num_workers,
         pin_memory=True,
-        drop_last=False
+        drop_last=False,
+        prefetch_factor=4,
+        persistent_workers=True if num_workers > 0 else False
     )
     
     return train_loader, test_loader
 
 
 # ============================================================================
-# Stage 1: Event-aware Bridge Pretraining Dataset
+# Edge to DVS Transfer Learning Dataset
 # ============================================================================
 
-class Stage1BridgeDataset(Dataset):
+class EdgeDataset(Dataset):
     """
-    Stage 1 Bridge训练数据集（优化版：使用预处理的edge数据）
+    加载预处理的Edge数据（按类别组织）
     
-    目标：category-level匹配的RGB-edge和DVS数据
-    行为：
-    - 每次迭代采样一个类别
-    - 从该类别中分别取edge样本和DVS样本
-    - edge数据已预处理（节省显存）
-    - DVS样本作为真实事件数据
+    注意：遵循N-Caltech101标准，过滤掉Faces类并重新映射标签（与DVS数据集保持一致）
     
-    注意：不要求instance-level对齐，只要求类别一致
+    标签映射说明：
+    - Edge数据保存时使用原始Caltech101标签（可能包含Faces类）
+    - N-Caltech101标准移除了Faces类
+    - 需要重新映射标签以匹配DVS数据集
     """
-    
-    def __init__(self, edge_root, dvs_root, train=True, edge_transform=None, 
-                 dvs_transform=None, img_size=48):
-        """
-        Args:
-            edge_root: 预处理的Edge数据根目录（包含.pt文件）
-            dvs_root: DVS数据根目录（train或test子目录）
-            train: 训练模式（True）或测试模式（False）
-            edge_transform: Edge数据变换（通常不需要）
-            dvs_transform: DVS数据变换
-            img_size: 图像尺寸
-        """
-        self.edge_root = edge_root
-        self.dvs_root = dvs_root
-        self.train = train
-        self.edge_transform = edge_transform
-        self.dvs_transform = dvs_transform
-        self.img_size = img_size
+    def __init__(self, root, sample_ratio=1.0):
+        self.root = root
+        self.samples = []
+        self.class_to_idx = {}
+        self.label_mapping = {}  # 原始标签 -> 新标签的映射
         
-        # 加载数据
-        self._load_edge_data()
-        self._load_dvs_data_via_nCaltech101()  # 使用NCaltech101来获取正确标签
+        # 第一遍：收集所有类别和对应的原始标签
+        class_dirs = sorted(os.listdir(root))
+        original_labels = []
+        valid_classes = []
         
-        # 构建类别索引
-        self._build_category_index()
-    
-    def _load_edge_data(self):
-        """加载预处理的Edge数据"""
-        if not os.path.exists(self.edge_root):
-            raise FileNotFoundError(f"Edge数据目录不存在: {self.edge_root}")
-        
-        # 获取所有.pt文件
-        pt_files = [f for f in os.listdir(self.edge_root) if f.endswith('.pt')]
-        
-        if len(pt_files) == 0:
-            raise FileNotFoundError(f"Edge目录中没有找到.pt文件: {self.edge_root}")
-        
-        # 排序
-        def extract_number(filename):
-            try:
-                return int(filename.replace('.pt', ''))
-            except ValueError:
-                return 0
-        
-        pt_files = sorted(pt_files, key=extract_number)
-        
-        self.edge_data = []
-        self.edge_labels = []
-        
-        print(f"  正在加载Edge数据 (共 {len(pt_files)} 个文件)...")
-        
-        for file_name in pt_files:
-            file_path = os.path.join(self.edge_root, file_name)
-            try:
-                edge, label = torch.load(file_path, weights_only=True)
-                
-                # 处理标签
-                if isinstance(label, torch.Tensor):
-                    label = label.item() if label.numel() == 1 else label[0].item()
-                
-                self.edge_data.append(edge)  # edge已经是tensor，直接存储
-                self.edge_labels.append(int(label))
-                
-            except Exception as e:
-                print(f"  警告: 无法加载Edge文件 {file_name}: {e}")
+        for class_dir in class_dirs:
+            # N-Caltech101标准：跳过Faces类
+            if class_dir.lower() == 'faces':
+                print(f"  跳过Faces类（N-Caltech101标准）")
                 continue
+            
+            class_path = os.path.join(root, class_dir)
+            if os.path.isdir(class_path):
+                # 读取一个样本以获取原始标签
+                pt_files = [f for f in os.listdir(class_path) if f.endswith('.pt')]
+                if pt_files:
+                    sample_file = os.path.join(class_path, pt_files[0])
+                    _, original_label = torch.load(sample_file, weights_only=True)
+                    if isinstance(original_label, torch.Tensor):
+                        original_label = original_label.item()
+                    
+                    original_labels.append(original_label)
+                    valid_classes.append(class_dir)
         
-        print(f"✓ Edge数据加载完成: {len(self.edge_data)} 样本")
-    
-    def _load_dvs_data_via_nCaltech101(self):
-        """使用NCaltech101类加载DVS数据，确保标签正确"""
-        if not os.path.exists(self.dvs_root):
-            raise FileNotFoundError(f"DVS数据目录不存在: {self.dvs_root}")
+        # 创建标签映射：按原始标签排序后重新分配连续标签
+        sorted_indices = sorted(range(len(original_labels)), key=lambda i: original_labels[i])
+        for new_label, idx in enumerate(sorted_indices):
+            old_label = original_labels[idx]
+            self.label_mapping[old_label] = new_label
+            self.class_to_idx[valid_classes[idx]] = new_label
         
-        # 检查DVS目录中的文件
-        all_files = os.listdir(self.dvs_root)
-        pt_files = [f for f in all_files if f.endswith('.pt')]
+        print(f"  标签重映射: {len(self.label_mapping)} 个类别")
+        print(f"  标签范围: {min(self.label_mapping.values())} - {max(self.label_mapping.values())}")
         
-        if len(pt_files) == 0:
-            raise FileNotFoundError(f"DVS目录中没有找到.pt文件: {self.dvs_root}")
+        # 检查标签是否连续
+        expected_labels = set(range(len(self.label_mapping)))
+        actual_labels = set(self.label_mapping.values())
+        if expected_labels != actual_labels:
+            missing = expected_labels - actual_labels
+            print(f"  ⚠️  警告: 标签不连续，缺失标签: {sorted(missing)}")
         
-        print(f"  DVS目录: {self.dvs_root}")
-        print(f"  目录中总文件数: {len(all_files)}")
-        print(f"  .pt文件数: {len(pt_files)}")
+        # 第二遍：收集所有样本
+        for class_dir in valid_classes:
+            class_path = os.path.join(root, class_dir)
+            pt_files = sorted([f for f in os.listdir(class_path) if f.endswith('.pt')])
+            for filename in pt_files:
+                filepath = os.path.join(class_path, filename)
+                self.samples.append(filepath)
         
-        # 提取文件索引
-        def extract_index(filename):
-            """从文件名中提取索引，如 '0_np.pt' -> 0"""
-            try:
-                basename = filename.replace('.pt', '').replace('_np', '')
-                return int(basename)
-            except:
-                return None
-        
-        # 构建索引到文件名的映射
-        index_to_file = {}
-        for f in pt_files:
-            idx = extract_index(f)
-            if idx is not None:
-                index_to_file[idx] = f
-        
-        print(f"  有效索引范围: {min(index_to_file.keys())} - {max(index_to_file.keys())}")
-        
-        self.dvs_data = []
-        self.dvs_labels = []
-        
-        # 按索引顺序加载
-        print(f"  正在加载DVS数据...")
-        error_count = 0
-        
-        for idx in sorted(index_to_file.keys()):
-            file_path = os.path.join(self.dvs_root, index_to_file[idx])
-            try:
-                # 直接加载文件
-                data, target = torch.load(file_path, weights_only=True)
-                
-                # 处理标签
-                if isinstance(target, torch.Tensor):
-                    target = target.item() if target.numel() == 1 else target[0].item()
-                
-                # 存储数据和标签
-                self.dvs_data.append((data, file_path))
-                self.dvs_labels.append(int(target))
-                
-            except Exception as e:
-                error_count += 1
-                if error_count <= 5:  # 只显示前5个错误
-                    print(f"  警告: 无法加载DVS文件 {index_to_file[idx]}: {e}")
-                continue
-        
-        if error_count > 5:
-            print(f"  (省略了 {error_count - 5} 个错误)")
-        
-        # 统计信息
-        if len(self.dvs_labels) == 0:
-            raise ValueError(f"无法加载任何DVS数据！请检查DVS目录: {self.dvs_root}")
-        
-        unique_labels = sorted(set(self.dvs_labels))
-        print(f"✓ DVS数据加载完成: {len(self.dvs_data)} 样本")
-        print(f"  DVS标签范围: {min(self.dvs_labels)} - {max(self.dvs_labels)}")
-        print(f"  DVS唯一标签数: {len(unique_labels)}")
-    
-    def _build_category_index(self):
-        """构建类别索引：每个类别对应的样本索引"""
-        from collections import defaultdict
-        
-        self.edge_by_category = defaultdict(list)
-        self.dvs_by_category = defaultdict(list)
-        
-        for idx, label in enumerate(self.edge_labels):
-            self.edge_by_category[label].append(idx)
-        
-        for idx, label in enumerate(self.dvs_labels):
-            self.dvs_by_category[label].append(idx)
-        
-        # 找到Edge和DVS都存在的类别
-        self.common_categories = list(set(self.edge_by_category.keys()) & 
-                                      set(self.dvs_by_category.keys()))
-        self.common_categories.sort()
-        
-        print(f"✓ 共有类别数: {len(self.common_categories)}")
-        print(f"  Edge类别数: {len(self.edge_by_category)}")
-        print(f"  DVS类别数: {len(self.dvs_by_category)}")
+        # 采样
+        if sample_ratio < 1.0:
+            n_samples = int(len(self.samples) * sample_ratio)
+            self.samples = self.samples[:n_samples]
     
     def __len__(self):
-        """数据集大小：以Edge数据为基准"""
-        return len(self.edge_data)
+        return len(self.samples)
     
     def __getitem__(self, index):
-        """
-        获取一对category-matched的Edge和DVS样本
+        filepath = self.samples[index]
+        # 加载原始数据和标签
+        edge, original_label = torch.load(filepath, weights_only=True)  # (2, H, W), label
         
-        Returns:
-            (edge_img, dvs_data), label
-            - edge_img: 边缘图（2通道，已预处理）
-            - dvs_data: DVS事件数据
-            - label: 类别标签
-        """
-        # 获取Edge样本
-        edge_img = self.edge_data[index]  # (2, H, W)
-        edge_label = self.edge_labels[index]
+        # 确保标签是标量
+        if isinstance(original_label, torch.Tensor):
+            original_label = original_label.item()
         
-        # 在DVS数据中找同类别样本
-        if edge_label in self.dvs_by_category and len(self.dvs_by_category[edge_label]) > 0:
-            # 同类别匹配
-            dvs_indices = self.dvs_by_category[edge_label]
-            dvs_idx = dvs_indices[index % len(dvs_indices)]
-        else:
-            # 如果该类别无DVS数据，随机选择一个
-            dvs_idx = index % len(self.dvs_data)
+        # 重新映射标签以匹配N-Caltech101标准
+        remapped_label = self.label_mapping.get(original_label, original_label)
         
-        # 获取DVS样本
-        dvs_data, _ = self.dvs_data[dvs_idx]
-        
-        # DVS数据变换（如果需要）
-        if self.dvs_transform is not None:
-            dvs_data = self.dvs_transform(dvs_data)
-        else:
-            # 默认变换：确保格式为 (T, 2, H, W)
-            dvs_data = self._default_dvs_transform(dvs_data)
-        
-        # edge_img已经是(2, H, W)格式，不需要额外变换
-        return (edge_img, dvs_data), edge_label
+        return edge, remapped_label
+
+
+class TLEdge2DVSDataset(Dataset):
+    """Edge到DVS迁移学习数据集"""
+    def __init__(self, edge_root, dvs_dataset, edge_ratio=1.0):
+        self.edge_dataset = EdgeDataset(edge_root, edge_ratio)
+        self.dvs_dataset = dvs_dataset
     
-    def _default_dvs_transform(self, dvs_data):
-        """默认DVS数据变换"""
-        original_shape = dvs_data.shape
+    def __len__(self):
+        return max(len(self.edge_dataset), len(self.dvs_dataset))
+    
+    def __getitem__(self, index):
+        # Edge数据
+        edge_idx = index % len(self.edge_dataset)
+        edge, edge_label = self.edge_dataset[edge_idx]
         
-        if len(original_shape) == 4:
-            if original_shape[0] == 2 and original_shape[3] >= 10:
-                # (C, H, W, T) -> (T, C, H, W)
-                dvs_data = dvs_data.permute(3, 0, 1, 2)
-            elif original_shape[1] == 2:
-                # 已经是 (T, C, H, W)
-                pass
+        # DVS数据
+        dvs_idx = index % len(self.dvs_dataset)
+        dvs_data, dvs_label = self.dvs_dataset[dvs_idx]
         
-        # 归一化到 [0, 1]
-        if dvs_data.max() > 1.0:
-            dvs_data = dvs_data / 255.0
-        
-        return dvs_data
+        return (edge, dvs_data), (edge_label, dvs_label)
+    
+    def get_len(self):
+        return [len(self.edge_dataset), len(self.dvs_dataset)]
 
 
-def get_stage1_bridge_caltech101(batch_size, train_set_ratio=1.0, dvs_train_set_ratio=1.0, 
-                                 edge_data_path=None):
+def get_edge2dvs_caltech101(batch_size, edge_root, dvs_root, 
+                            edge_ratio=1.0, dvs_ratio=1.0, 
+                            num_workers=8, img_size=48, split_ratio=0.9):
     """
-    获取Stage 1 Bridge训练数据加载器（优化版：使用预处理的edge数据）
+    获取Edge到DVS迁移学习的数据加载器
     
     Args:
         batch_size: 批次大小
-        train_set_ratio: 训练集使用比例
-        dvs_train_set_ratio: DVS训练集使用比例
-        edge_data_path: 预处理的Edge数据路径（如果为None，使用默认路径）
+        edge_root: Edge数据根目录（按类别组织）
+        dvs_root: DVS数据根目录（使用NCaltech101Dataset加载方式）
+        edge_ratio: Edge数据使用比例
+        dvs_ratio: DVS数据使用比例
+        num_workers: 数据加载线程数
+        img_size: 图像尺寸
+        split_ratio: 当没有train/test划分时的训练集比例
     
-    返回：
-    - train_loader: category-matched的Edge和DVS数据
-    - test_loader: DVS测试数据
+    Returns:
+        train_loader: 训练数据加载器
+        test_loader: 测试数据加载器
     """
-    # 设置Edge数据路径
-    if edge_data_path is None:
-        edge_data_path = '/home/user/kpm/kpm/Dataset/Caltech101/caltech101_edge'
+    import random
+    from torch.utils.data.sampler import SubsetRandomSampler
     
-    # DVS数据路径
-    dvs_train_path = '/home/user/kpm/kpm/Dataset/Caltech101/n-caltech101/train'
-    dvs_test_path = '/home/user/kpm/kpm/Dataset/Caltech101/n-caltech101/test'
+    # 加载Edge数据集
+    edge_dataset = EdgeDataset(edge_root, edge_ratio)
+    print(f"✓ Edge训练集: {len(edge_dataset)} 样本")
     
-    print("正在加载Stage 1 Bridge数据集（使用预处理的Edge数据）...")
-    print(f"  Edge数据路径: {edge_data_path}")
-    print(f"  DVS数据路径: {dvs_train_path}")
+    # 检查Edge数据集的标签范围
+    if len(edge_dataset) > 0:
+        sample_edge, sample_label = edge_dataset[0]
+        print(f"  Edge数据形状示例: {sample_edge.shape}")
+        print(f"  Edge标签示例: {sample_label}")
+        
+        # 采样检查标签范围 - 均匀采样以覆盖所有类别
+        labels = []
+        check_samples = min(100, len(edge_dataset))
+        # 均匀采样整个数据集，而不是只采样前100个
+        step = max(1, len(edge_dataset) // check_samples)
+        for i in range(0, len(edge_dataset), step):
+            _, label = edge_dataset[i]
+            labels.append(label)
+            if len(labels) >= check_samples:
+                break
+        print(f"  Edge标签范围（采样检查）: [{min(labels)}, {max(labels)}]")
+        print(f"  Edge唯一标签数: {len(set(labels))}")
     
-    # 检查Edge数据是否存在
-    if not os.path.exists(edge_data_path):
-        raise FileNotFoundError(
-            f"\nEdge数据目录不存在: {edge_data_path}\n"
-            f"请先运行预处理脚本:\n"
-            f"  python preprocess_rgb2edge.py --output_dir {edge_data_path}\n"
+    # 加载DVS数据集（使用与baseline相同的方式）
+    train_path = os.path.join(dvs_root, 'train')
+    test_path = os.path.join(dvs_root, 'test')
+    
+    has_split = os.path.exists(train_path) and os.path.exists(test_path)
+    
+    if has_split:
+        # 使用预先划分的train/test
+        dvs_train_dataset = NCaltech101Dataset(train_path, transform=True, img_size=img_size, 
+                                               use_nda=False, use_eventrpg=False)
+        dvs_test_dataset = NCaltech101Dataset(test_path, transform=False, img_size=img_size, 
+                                              use_nda=False, use_eventrpg=False)
+        
+        print(f"✓ DVS训练集: {len(dvs_train_dataset)} 样本")
+        print(f"✓ DVS测试集: {len(dvs_test_dataset)} 样本")
+        
+        # DVS训练集采样
+        if dvs_ratio < 1.0:
+            n_dvs = len(dvs_train_dataset)
+            indices = list(range(n_dvs))
+            random.shuffle(indices)
+            dvs_train_indices = indices[:int(n_dvs * dvs_ratio)]
+            dvs_train_sampler = SubsetRandomSampler(dvs_train_indices)
+        else:
+            dvs_train_sampler = None
+        
+        # 创建Edge2DVS训练数据集
+        train_dataset = TLEdge2DVSDataset(edge_root, dvs_train_dataset, edge_ratio)
+        
+        # 训练数据加载器
+        train_loader = DataLoaderX(
+            train_dataset, 
+            batch_size=batch_size, 
+            shuffle=(dvs_train_sampler is None),
+            sampler=None,  # TLEdge2DVSDataset自己处理采样
+            num_workers=num_workers, 
+            drop_last=True, 
+            pin_memory=True
+        )
+        
+        # 测试数据加载器（只用DVS数据）
+        test_loader = DataLoaderX(
+            dvs_test_dataset, 
+            batch_size=batch_size, 
+            shuffle=False,
+            num_workers=num_workers, 
+            drop_last=False, 
+            pin_memory=True
+        )
+    else:
+        # 没有train/test划分，自动划分
+        print(f"No train/test split found, auto-splitting with ratio {split_ratio}")
+        
+        full_dataset = NCaltech101Dataset(dvs_root, transform=False, img_size=img_size, 
+                                         use_nda=False, use_eventrpg=False)
+        
+        # 按类别划分
+        if hasattr(full_dataset, 'file_labels') and full_dataset.file_labels is not None:
+            from collections import defaultdict
+            samples_by_class = defaultdict(list)
+            for idx, label in enumerate(full_dataset.file_labels):
+                samples_by_class[label].append(idx)
+            
+            train_indices = []
+            test_indices = []
+            
+            for label, indices in samples_by_class.items():
+                random.shuffle(indices)
+                split_point = int(len(indices) * split_ratio)
+                train_indices.extend(indices[:split_point])
+                test_indices.extend(indices[split_point:])
+            
+            random.shuffle(train_indices)
+            random.shuffle(test_indices)
+        else:
+            all_indices = list(range(len(full_dataset)))
+            random.shuffle(all_indices)
+            split_point = int(len(all_indices) * split_ratio)
+            train_indices = all_indices[:split_point]
+            test_indices = all_indices[split_point:]
+        
+        # DVS采样
+        if dvs_ratio < 1.0:
+            n_use = int(len(train_indices) * dvs_ratio)
+            train_indices = train_indices[:n_use]
+        
+        print(f"✓ DVS训练集: {len(train_indices)} 样本")
+        print(f"✓ DVS测试集: {len(test_indices)} 样本")
+        
+        # 创建数据集
+        dvs_train_dataset = NCaltech101Dataset(dvs_root, transform=True, img_size=img_size, 
+                                               use_nda=False, use_eventrpg=False)
+        dvs_test_dataset = NCaltech101Dataset(dvs_root, transform=False, img_size=img_size, 
+                                              use_nda=False, use_eventrpg=False)
+        
+        # 创建Edge2DVS训练数据集
+        train_dataset = TLEdge2DVSDataset(edge_root, dvs_train_dataset, edge_ratio)
+        
+        # 训练数据加载器
+        train_loader = DataLoaderX(
+            train_dataset, 
+            batch_size=batch_size, 
+            shuffle=True,
+            num_workers=num_workers, 
+            drop_last=True, 
+            pin_memory=True
+        )
+        
+        # 测试数据加载器
+        test_sampler = SubsetRandomSampler(test_indices)
+        test_loader = DataLoaderX(
+            dvs_test_dataset, 
+            batch_size=batch_size, 
+            shuffle=False,
+            sampler=test_sampler,
+            num_workers=num_workers, 
+            drop_last=False, 
+            pin_memory=True
         )
     
-    # 创建Stage1数据集
-    train_dataset = Stage1BridgeDataset(
-        edge_root=edge_data_path,
-        dvs_root=dvs_train_path,
-        train=True,
-        edge_transform=None,  # Edge数据已预处理，不需要transform
-        img_size=48
-    )
-    
-    # 测试集：使用标准DVS测试集
-    test_dataset = NCaltech101(root=dvs_test_path, train=False, transform=False)
-    
-    # 采样
-    n_train = len(train_dataset)
-    split = int(n_train * train_set_ratio)
-    indices = list(range(n_train))
-    random.shuffle(indices)
-    train_sampler = SubsetRandomSampler(indices[:split])
-    
-    # 创建DataLoader
-    train_loader = DataLoaderX(
-        dataset=train_dataset,
-        batch_size=batch_size,
-        sampler=train_sampler,
-        drop_last=True,
-        pin_memory=True
-    )
-    
-    test_loader = DataLoaderX(
-        dataset=test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        drop_last=False,
-        pin_memory=True
-    )
-    
-    print(f"\n=== Stage 1 Bridge数据集 ===")
-    print(f"训练集: {len(train_dataset)} 样本 (使用 {train_set_ratio*100:.0f}%)")
-    print(f"测试集: {len(test_dataset)} 样本")
-    print(f"批次大小: {batch_size}")
-    print("===========================\n")
+    # 显示最终配对信息
+    print(f"\n最终数据集配对:")
+    edge_len, dvs_len = train_loader.dataset.get_len()
+    print(f"  Edge样本: {edge_len}")
+    print(f"  DVS样本: {dvs_len}")
+    if edge_len != dvs_len:
+        print(f"  ⚠️  样本数不一致，训练时使用循环采样（取模）策略")
     
     return train_loader, test_loader
+
+
+# ============================================================================
+# (Stage 1 Bridge components removed)
+# ============================================================================

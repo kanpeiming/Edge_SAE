@@ -3,7 +3,9 @@ N-Caltech101 数据集基线训练脚本
 Training script for N-Caltech101 dataset baseline model
 
 数据集要求 (Dataset Requirements):
-数据集路径应包含以下结构:
+支持两种数据格式：
+
+1. .pt格式（推荐，加载速度快）:
 dataset_path/
 ├── train/
 │   ├── 0_np.pt
@@ -13,6 +15,19 @@ dataset_path/
     ├── 0_np.pt
     ├── 1_np.pt
     └── ...
+
+2. .bin格式（原始事件数据）:
+dataset_path/
+├── accordion/
+│   ├── image_0001.bin
+│   └── ...
+├── wild_cat/
+│   ├── image_0016.bin
+│   └── ...
+└── ... (共101个类别目录)
+
+注意：.bin格式需要先使用预处理脚本转换为.pt格式以提高训练速度：
+python preprocess_bin_to_pt.py --bin_root /path/to/bin/data --pt_output /path/to/pt/data
 
 使用示例 (Usage Examples):
 1. 使用自定义数据集路径训练:
@@ -26,7 +41,7 @@ dataset_path/
 
 参数说明:
 - caltech101_dvs_path: N-Caltech101数据集路径 (包含train和test文件夹)
-- batch_size: 批次大小 (默认32)
+- batch_size: 批次大小 (默认64)
 - lr: 学习率 (默认0.001)
 - T: SNN时间步数 (默认10)
 - size: 输入图像尺寸 (默认48)
@@ -50,14 +65,14 @@ import torch
 import argparse
 from tqdm import tqdm
 from tl_utils.common_utils import seed_all
-from tl_utils.trainer import Trainer
+from tl_utils.trainer import BaselineTrainer
 from tl_utils.loss_function import TET_loss
 from dataloader.caltech101 import create_caltech101_dataloaders
 from models.snn_models.VGG import VGGSNN, VGGSNNwoAP
 from torch.utils.tensorboard import SummaryWriter
 
 parser = argparse.ArgumentParser(description='PyTorch Temporal Efficient Training for N-Caltech101')
-parser.add_argument('--batch_size', default=64, type=int, help='Batchsize')
+parser.add_argument('--batch_size', default=32, type=int, help='Batchsize')
 parser.add_argument('--lr', default=0.001, type=float, help='Learning rate')
 parser.add_argument('--weight_decay', default=5e-4, type=float, help='Weight decay')
 parser.add_argument('--epoch', default=100, type=int, help='Training epochs')
@@ -76,7 +91,7 @@ parser.add_argument('--pretrained_path', type=str, default=None,
                     help='the path of pretrained model parameters')
 parser.add_argument('--size', type=int, default=48,
                     help='Input image size for N-Caltech101')
-parser.add_argument('--caltech101_dvs_path', type=str, default='/home/user/kpm/kpm/Dataset/Caltech101/n-caltech101',
+parser.add_argument('--caltech101_dvs_path', type=str, default='/home/user/kpm/kpm/Dataset/Caltech101/NCALTECH101/NCALTECH101/Caltech101',
                     help='Path to N-Caltech101 DVS dataset (if not provided, will use default path in dataloader)')
 # Fine-tuning and pretrained model loading parameters
 parser.add_argument('--fine_tuning', default='no', type=str, help='Fine-tuning mode identifier')
@@ -88,6 +103,8 @@ parser.add_argument('--load_bottleneck', action='store_true', default=False,
                     help='Whether to load bottleneck related parameters from pretrained model (default: False)')
 parser.add_argument('--load_classifier', action='store_true', default=False,
                     help='Whether to load classifier related parameters from pretrained model (default: False)')
+parser.add_argument('--num_workers', type=int, default=8,
+                    help='Number of data loading workers (default: 4, use 0 for Windows if encountering issues)')
 args = parser.parse_args()
 
 # 添加缺失的data_set属性（trainer需要用到）
@@ -126,7 +143,7 @@ if __name__ == "__main__":
         data_path=args.caltech101_dvs_path,
         batch_size=args.batch_size,
         train_ratio=args.dvs_sample_ratio,
-        num_workers=8,
+        num_workers=args.num_workers,
         img_size=args.size,
         use_nda=False,
         use_eventrpg=False,
@@ -223,18 +240,38 @@ if __name__ == "__main__":
     print(f"\n使用TET (Temporal Efficient Training) Loss")
     criterion = TET_loss
 
-    # 训练
-    trainer = Trainer(args, device, writer, model, optimizer, criterion, scheduler, model_path)
-    trainer.train(train_loader, test_loader)
-
-    # 测试
-    print("Final testing...")
+    # 使用BaselineTrainer（不使用验证集，只在训练集上训练）
+    trainer = BaselineTrainer(args, device, writer, model, optimizer, criterion, scheduler, model_path)
+    
+    print("\n注意：使用BaselineTrainer - 训练过程中不使用验证集，仅在最后使用测试集评估")
+    print("=" * 80)
+    
+    best_train_acc = trainer.train(train_loader)
+    
+    print("\n" + "=" * 80)
+    print("训练完成！开始在测试集上进行最终评估...")
+    print("=" * 80)
+    
+    # 加载最佳模型
+    if os.path.exists(model_path):
+        print(f"加载最佳训练模型: {model_path}")
+        checkpoint = torch.load(model_path, map_location=device)
+        if 'net' in checkpoint:
+            model.load_state_dict(checkpoint['net'])
+        else:
+            model.load_state_dict(checkpoint)
+    
+    # 在测试集上进行最终评估
     test_loss, test_acc = trainer.test(test_loader)
-    print(f'Final test results - Loss: {test_loss:.5f}, Accuracy: {test_acc:.5f} ({test_acc*100:.1f}%)')
+    print(f'\n最终测试结果:')
+    print(f'  Loss: {test_loss:.5f}')
+    print(f'  Accuracy: {test_acc:.5f} ({test_acc*100:.2f}%)')
+    print(f'  最佳训练准确率: {best_train_acc:.5f} ({best_train_acc*100:.2f}%)')
     
     # 记录最终测试结果
     writer.add_scalar(tag="final_test/accuracy", scalar_value=test_acc, global_step=0)
     writer.add_scalar(tag="final_test/loss", scalar_value=test_loss, global_step=0)
+    writer.add_scalar(tag="final_test/train_accuracy", scalar_value=best_train_acc, global_step=0)
     
     writer.close()
     print(f"Training completed. Model saved to: {model_path}")

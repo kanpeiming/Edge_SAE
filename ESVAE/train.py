@@ -32,7 +32,7 @@ parser.add_argument('--optim', default='Adam', type=str, choices=['SGD', 'Adam']
 parser.add_argument('--lr', default=0.001, type=float,
                     help='Learning rate')  # CIFAR10: 0.0002, Caltech101: 0.0002, MNIST: 0.0001
 parser.add_argument('--weight_decay', default=5e-4, type=float, help='Weight decay')
-parser.add_argument('--epochs', default=30, type=int, help='Training epochs')
+parser.add_argument('--epochs', default=50, type=int, help='Training epochs')
 # parser.add_argument('--id', default='test', type=str, help='Model identifier')
 parser.add_argument('--device', default='cuda', type=str, help='cuda or cpu')
 parser.add_argument('--parallel', default=False, type=bool, help='Whether to use multi-GPU parallelism')
@@ -71,7 +71,7 @@ parser.add_argument('--trt_epsilon', type=float, default=1e-5,
                     help='TRT epsilon ε (default: 1e-5)')
 parser.add_argument('--trt_eta', type=float, default=0.05,
                     help='TRT eta η (MSE loss weight, default: 0.05)')
-parser.add_argument('--edge_method', type=str, default='SobelAndCanny',help = 'how to use edge method.')
+parser.add_argument('--edge_method', type=str, default='Sobel',help = 'how to use edge method.')
 
 args = parser.parse_args()
 
@@ -118,8 +118,11 @@ if __name__ == "__main__":
 
     # preparing data
     if args.data_set == 'CIFAR10':
+        # 只使用训练集进行预训练（无数据泄露）
         train_loader = dataloader.cifar.get_cifar10(32, 1.0)
-        print("训练集RGB数量", train_loader.get_len())
+        print(f"训练集RGB数量: {len(train_loader.dataset)} 样本")
+        print(f"数据来源: CIFAR10训练集 (50,000样本)")
+        print(f"注意: 预训练阶段只使用训练集，测试在后续阶段进行")
         # print("RGB数量转换为边缘图的数量", target_train_loader.get_len())
         # print("训练集DVS数量", train_loader.get_len()[1])
         # print("测试集DVS数量", dvs_test_loader.get_len()[1])
@@ -147,8 +150,11 @@ if __name__ == "__main__":
     #     print("训练集DVS数量", train_loader.get_len()[1])
     #     print("测试集DVS数量", dvs_test_loader.get_len()[1])
     elif args.data_set == 'MNIST':
+        # 只使用训练集进行预训练（无数据泄露）
         train_loader = get_mnist(args.batch_size, 1.0)
-        print("训练集RGB数量", len(train_loader.dataset))
+        print(f"训练集RGB数量: {len(train_loader.dataset)} 样本")
+        print(f"数据来源: MNIST训练集")
+        print(f"注意: 预训练阶段只使用训练集，测试在后续阶段进行")
     # elif args.data_set == 'ImageNet100':
     #     train_loader, dvs_val_loader, dvs_test_loader_list = get_tl_imagenet100(args.batch_size, args.RGB_sample_ratio,
     #                                                                             args.dvs_sample_ratio, args.seed,
@@ -227,7 +233,10 @@ if __name__ == "__main__":
         criterion = TET_loss
 
     # 训练（使用修改后的训练器）
-    trainer = AlignmentTLTrainer_Edge_1(args, device, writer, model, optimizer, criterion, scheduler, model_path)
+    trainer = AlignmentTLTrainer_Edge_1(
+        args, device, writer, model, optimizer, criterion, scheduler,
+        os.path.join(model_path, "rgb_edge_pretrained.pth")
+    )
 
     # RGB->Edge预训练：只需要训练，不需要测试
     best_train_acc, best_train_loss = trainer.train(train_loader)
@@ -237,17 +246,43 @@ if __name__ == "__main__":
     print(f"最佳训练准确率: {best_train_acc:.3f}")
     print(f"最佳训练损失: {best_train_loss:.5f}")
     
+    # 保存RGB->Edge预训练模型
+    pretrained_path = os.path.join(model_path, "rgb_edge_pretrained_best.pth")
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'best_train_acc': best_train_acc,
+        'best_train_loss': best_train_loss,
+        'args': args
+    }, pretrained_path)
+    print(f"RGB->Edge预训练模型已保存到: {pretrained_path}")
+    
+    # 记录训练结果到TensorBoard
+    writer.add_scalar(tag="final/rgb_edge_accuracy", scalar_value=best_train_acc, global_step=0)
+    writer.add_scalar(tag="final/rgb_edge_loss", scalar_value=best_train_loss, global_step=0)
+    
     # 如果需要测试，请使用专门的测试脚本
     # if args.data_set == 'ImageNet100':
     #     test_loss, test_acc1, test_acc5 = trainer.test(dvs_test_loader_list)
     # else:
     #     test_loss, test_acc1, test_acc5 = trainer.test(dvs_test_loader)
 
-    # 保存训练结果
+    # 保存训练结果到文件
     write_content = (
-        f'seed: {args.seed} \n'
-        f'RGB->Edge预训练 \n'
-        f'best_train_acc: {best_train_acc:.3f}, best_train_loss: {best_train_loss:.5f} \n\n'
+        f'=== {args.data_set} RGB->Edge预训练 结果 ===\n'
+        f'种子: {args.seed}\n'
+        f'边缘提取器: Sobel + Canny双算法 (2通道输出)\n'
+        f'模型: VGGSNN\n'
+        f'预训练epochs: {args.epochs}, 学习率: {args.lr}\n'
+        f'编码器迁移损失: {args.encoder_tl_lamb} × {args.encoder_tl_loss_type}\n'
+        f'特征迁移损失: {args.feature_tl_lamb} × {args.feature_tl_loss_type}\n'
+        f'RGB->Edge预训练准确率: {best_train_acc:.3f}%\n'
+        f'预训练模型保存路径: {pretrained_path}\n'
+        f'=====================================\n\n'
     )
     f.write(write_content)
     f.close()
+    
+    writer.close()
+    print(f"\n预训练完成！模型已保存到: {pretrained_path}")
+    print(f"结果已记录到: {args.data_set}_{args.seed}_grid_result.txt")

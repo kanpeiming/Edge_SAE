@@ -397,11 +397,15 @@ class DVSCifar10v1(Dataset):
         filepath, label = self.samples[index]  # label 已从文件夹名称映射
         data = torch.load(filepath, weights_only=True)  # 直接加载张量
         target = label  # 标签来自文件夹名称
-        # 如果 data 是视频帧或多帧数据，处理每一帧
-        new_data = []
-        for t in range(data.size(0)):
-            new_data.append(self.tensorx(self.resize(self.imgx(data[t, ...]))))
-        data = torch.stack(new_data, dim=0)
+        
+        # 优化：批量resize，避免Tensor→PIL→Tensor转换
+        if data.shape[2] != 48 or data.shape[3] != 48:
+            data = torch.nn.functional.interpolate(
+                data.float(),  # (T, C, H, W)
+                size=(48, 48),
+                mode='bilinear',
+                align_corners=False
+            )
 
         if self.transform:
             if self.use_eventrpg:
@@ -661,3 +665,282 @@ def my_random_split(dataset, lengths, generator):
     indices = torch.randperm(sum(lengths), generator=generator).tolist()
     return [MySubset(dataset, indices[offset - length: offset]) for offset, length in
             zip(_accumulate(lengths), lengths)]
+
+
+# ============================================================================
+# CIFAR10 Edge to DVS Transfer Learning Dataset
+# ============================================================================
+
+class EdgeDatasetCIFAR10(Dataset):
+    """
+    加载预处理的CIFAR10 Edge数据（按类别组织）
+    
+    CIFAR10有10个类别，标签从0-9
+    """
+    def __init__(self, root, sample_ratio=1.0):
+        self.root = root
+        self.samples = []
+        self.class_to_idx = {}
+        
+        # CIFAR10类别名称（按标签顺序）
+        cifar10_classes = ['airplane', 'automobile', 'bird', 'cat', 'deer', 
+                          'dog', 'frog', 'horse', 'ship', 'truck']
+        
+        # 收集所有类别的样本
+        class_dirs = sorted(os.listdir(root))
+        
+        for class_dir in class_dirs:
+            class_path = os.path.join(root, class_dir)
+            if os.path.isdir(class_path):
+                # 获取类别索引
+                if class_dir in cifar10_classes:
+                    label = cifar10_classes.index(class_dir)
+                    self.class_to_idx[class_dir] = label
+                    
+                    # 收集该类别的所有样本
+                    pt_files = sorted([f for f in os.listdir(class_path) if f.endswith('.pt')])
+                    
+                    # 按比例采样
+                    if sample_ratio < 1.0:
+                        n_samples = int(len(pt_files) * sample_ratio)
+                        pt_files = pt_files[:n_samples]
+                    
+                    for pt_file in pt_files:
+                        filepath = os.path.join(class_path, pt_file)
+                        self.samples.append(filepath)
+        
+        print(f"  EdgeDatasetCIFAR10: {len(self.samples)} 样本")
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, index):
+        filepath = self.samples[index]
+        # 加载原始数据和标签
+        edge, label = torch.load(filepath, weights_only=True)  # (2, H, W), label
+        
+        # 确保标签是标量
+        if isinstance(label, torch.Tensor):
+            label = label.item()
+        
+        # 归一化处理：对Edge数据进行标准化
+        # Edge数据通常是Sobel边缘响应，值域约为[0, 1]
+        # 使用简单的归一化将其映射到标准范围
+        if edge.dtype != torch.float32:
+            edge = edge.float()
+        
+        # 对每个通道进行归一化（2通道：水平和垂直边缘）
+        # 使用与CIFAR10类似的归一化参数
+        mean = torch.tensor([0.5, 0.5]).view(2, 1, 1)
+        std = torch.tensor([0.5, 0.5]).view(2, 1, 1)
+        edge = (edge - mean) / std
+        
+        return edge, label
+
+
+class TLEdge2DVSDatasetCIFAR10(Dataset):
+    """
+    CIFAR10 Edge到DVS迁移学习数据集
+    使用方案1（TLCIFAR10风格）：基于累积索引的动态配对
+    
+    优势：
+    - 内存占用低（只存储累积数组）
+    - 初始化快（无需遍历构建索引映射）
+    - 代码简洁
+    """
+    def __init__(self, edge_root, dvs_dataset, edge_ratio=1.0):
+        print("  初始化TLEdge2DVSDatasetCIFAR10（方案1：累积索引动态配对）...")
+        
+        self.edge_dataset = EdgeDatasetCIFAR10(edge_root, edge_ratio)
+        self.dvs_dataset = dvs_dataset
+        
+        # 按标签排序Edge数据（关键步骤）
+        print("  对Edge数据按标签排序...")
+        edge_samples_with_labels = []
+        for filepath in self.edge_dataset.samples:
+            edge, label = torch.load(filepath, weights_only=True)
+            if isinstance(label, torch.Tensor):
+                label = label.item()
+            edge_samples_with_labels.append((filepath, label))
+        
+        # 按标签排序
+        edge_samples_with_labels.sort(key=lambda x: x[1])
+        self.edge_samples = [x[0] for x in edge_samples_with_labels]
+        self.edge_labels = [x[1] for x in edge_samples_with_labels]
+        
+        # 构建Edge累积大小数组
+        self.edge_cumulative_sizes = self.cumsum(self.edge_labels)
+        
+        # 构建DVS累积大小数组
+        print("  构建DVS累积索引...")
+        if hasattr(self.dvs_dataset, 'samples'):
+            # DVSCifar10v1有samples属性，直接提取标签
+            dvs_labels = [label for _, label in self.dvs_dataset.samples]
+        else:
+            # 备选方案：遍历加载（较慢）
+            print("  警告：DVS数据集没有samples属性，遍历获取标签...")
+            dvs_labels = []
+            for idx in range(len(self.dvs_dataset)):
+                _, label = self.dvs_dataset[idx]
+                if isinstance(label, torch.Tensor):
+                    label = label.item()
+                dvs_labels.append(label)
+        
+        self.dvs_cumulative_sizes = self.cumsum(dvs_labels)
+        
+        print(f"  ✓ Edge样本数: {len(self.edge_samples)}")
+        print(f"  ✓ DVS样本数: {len(self.dvs_dataset)}")
+        print(f"  ✓ 使用累积索引动态配对（类内循环采样）")
+    
+    @staticmethod
+    def cumsum(targets):
+        """计算累积和数组（与TLCIFAR10相同的实现）"""
+        result = Counter(targets)
+        r, s = [0], 0
+        for e in range(len(result)):
+            l = result[e]
+            r.append(l + s)
+            s += l
+        return r
+    
+    def __len__(self):
+        return len(self.edge_samples)
+    
+    def __getitem__(self, index):
+        # 加载Edge样本
+        edge_filepath = self.edge_samples[index]
+        edge, edge_label = torch.load(edge_filepath, weights_only=True)
+        if isinstance(edge_label, torch.Tensor):
+            edge_label = edge_label.item()
+        
+        # 使用bisect找到Edge样本的类别（与TLCIFAR10相同的逻辑）
+        dataset_idx = bisect.bisect_right(self.edge_cumulative_sizes, index)
+        
+        # 找到该类别对应的DVS样本范围
+        dvs_index_start = self.dvs_cumulative_sizes[dataset_idx - 1]
+        dvs_index_end = self.dvs_cumulative_sizes[dataset_idx]
+        
+        # 类内循环采样（取模运算）
+        dvs_index = dvs_index_start + (index - self.edge_cumulative_sizes[dataset_idx - 1]) % (
+            dvs_index_end - dvs_index_start)
+        
+        # 加载对应的DVS样本
+        dvs_data, dvs_label = self.dvs_dataset[dvs_index]
+        if isinstance(dvs_label, torch.Tensor):
+            dvs_label = dvs_label.item()
+        
+        # 验证标签匹配（调试用）
+        assert edge_label == dvs_label, f"标签不匹配: Edge={edge_label}, DVS={dvs_label}"
+        
+        return (edge, dvs_data), (edge_label, dvs_label)
+    
+    def get_len(self):
+        return [len(self.edge_samples), len(self.dvs_dataset)]
+
+
+def get_edge2dvs_cifar10(batch_size, edge_root, dvs_root, 
+                        edge_ratio=1.0, dvs_ratio=1.0, 
+                        num_workers=8, img_size=48, split_ratio=0.9):
+    """
+    获取CIFAR10 Edge到DVS迁移学习的数据加载器
+    
+    Args:
+        batch_size: 批次大小
+        edge_root: Edge数据根目录（按类别组织）
+        dvs_root: DVS数据根目录（使用DVSCifar10v1加载方式）
+        edge_ratio: Edge数据使用比例
+        dvs_ratio: DVS数据使用比例
+        num_workers: 数据加载线程数
+        img_size: 图像尺寸
+        split_ratio: 当没有train/test划分时的训练集比例
+    
+    Returns:
+        train_loader: 训练数据加载器
+        test_loader: 测试数据加载器
+    """
+    from torch.utils.data.sampler import SubsetRandomSampler
+    
+    # 加载Edge数据集
+    edge_dataset = EdgeDatasetCIFAR10(edge_root, edge_ratio)
+    print(f"✓ Edge训练集: {len(edge_dataset)} 样本")
+    
+    # 检查Edge数据集的标签范围
+    if len(edge_dataset) > 0:
+        sample_edge, sample_label = edge_dataset[0]
+        print(f"  Edge数据形状示例: {sample_edge.shape}")
+        print(f"  Edge标签示例: {sample_label}")
+        
+        # 采样检查标签范围 - 均匀采样以覆盖所有类别
+        labels = []
+        check_samples = min(100, len(edge_dataset))
+        # 均匀采样整个数据集，而不是只采样前100个
+        step = max(1, len(edge_dataset) // check_samples)
+        for i in range(0, len(edge_dataset), step):
+            _, label = edge_dataset[i]
+            labels.append(label)
+            if len(labels) >= check_samples:
+                break
+        print(f"  Edge标签范围（采样检查）: [{min(labels)}, {max(labels)}]")
+        print(f"  Edge唯一标签数: {len(set(labels))}")
+    
+    # 加载DVS数据集
+    train_path = os.path.join(dvs_root, 'train')
+    test_path = os.path.join(dvs_root, 'test')
+    
+    has_split = os.path.exists(train_path) and os.path.exists(test_path)
+    
+    if has_split:
+        # 使用预先划分的train/test
+        dvs_train_dataset = DVSCifar10v1(train_path, train=True, transform=True, 
+                                        use_nda=False, use_eventrpg=False)
+        dvs_test_dataset = DVSCifar10v1(test_path, train=False, transform=False, 
+                                       use_nda=False, use_eventrpg=False)
+        
+        print(f"✓ DVS训练集: {len(dvs_train_dataset)} 样本")
+        print(f"✓ DVS测试集: {len(dvs_test_dataset)} 样本")
+        
+        # DVS训练集采样
+        if dvs_ratio < 1.0:
+            n_dvs = len(dvs_train_dataset)
+            indices = list(range(n_dvs))
+            random.shuffle(indices)
+            dvs_train_indices = indices[:int(n_dvs * dvs_ratio)]
+            dvs_train_sampler = SubsetRandomSampler(dvs_train_indices)
+        else:
+            dvs_train_sampler = None
+        
+        # 创建Edge2DVS训练数据集
+        train_dataset = TLEdge2DVSDatasetCIFAR10(edge_root, dvs_train_dataset, edge_ratio)
+        
+        # 训练数据加载器
+        train_loader = DataLoaderX(
+            train_dataset, 
+            batch_size=batch_size, 
+            shuffle=(dvs_train_sampler is None),
+            sampler=None,  # TLEdge2DVSDatasetCIFAR10自己处理采样
+            num_workers=num_workers, 
+            drop_last=True, 
+            pin_memory=True
+        )
+        
+        # 测试数据加载器（只用DVS数据）
+        test_loader = DataLoaderX(
+            dvs_test_dataset, 
+            batch_size=batch_size, 
+            shuffle=False,
+            num_workers=num_workers, 
+            drop_last=False, 
+            pin_memory=True
+        )
+    else:
+        raise ValueError(f"CIFAR10DVS必须有train/test划分，但在{dvs_root}中未找到")
+    
+    # 显示最终配对信息
+    print(f"\n最终数据集配对:")
+    edge_len, dvs_len = train_loader.dataset.get_len()
+    print(f"  Edge样本: {edge_len}")
+    print(f"  DVS样本: {dvs_len}")
+    if edge_len != dvs_len:
+        print(f"  ⚠️  样本数不一致，训练时使用循环采样（取模）策略")
+    
+    return train_loader, test_loader

@@ -9,6 +9,7 @@
 from .cifar import *
 from .mnist import *
 from .caltech101 import *
+from .cepdvs import *
 from .dataloader_utils import (
     DVSAugment,
     DVSAugmentCaltech101,

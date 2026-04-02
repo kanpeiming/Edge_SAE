@@ -67,7 +67,7 @@ def sobel_edge_extraction(img_tensor):
 
 def preprocess_rgb_to_edge(rgb_root, output_dir, img_size=48):
     """
-    将RGB数据集转换为edge数据集
+    将RGB数据集转换为edge数据集（按类别保存）
     
     Args:
         rgb_root: RGB Caltech101根目录
@@ -94,42 +94,98 @@ def preprocess_rgb_to_edge(rgb_root, output_dir, img_size=48):
     try:
         dataset = datasets.Caltech101(caltech101_root, transform=transform, download=False)
         print(f"✓ 使用Caltech101数据集")
+        use_caltech101 = True
     except RuntimeError:
         dataset = datasets.ImageFolder(rgb_root, transform=transform)
         print(f"✓ 使用ImageFolder数据集")
+        use_caltech101 = False
     
     print(f"数据集大小: {len(dataset)} 样本")
-    print(f"类别数: {len(dataset.classes) if hasattr(dataset, 'classes') else 'N/A'}")
+    
+    # 获取类别信息
+    if use_caltech101:
+        # Caltech101的类别名称
+        categories = dataset.categories
+        print(f"类别数: {len(categories)}")
+    else:
+        # ImageFolder的类别名称
+        categories = dataset.classes
+        print(f"类别数: {len(categories)}")
+    
+    # N-Caltech101标准：过滤掉Faces类
+    faces_in_categories = 'Faces' in categories or 'faces' in categories
+    if faces_in_categories:
+        print(f"\n⚠️  检测到Faces类，将按N-Caltech101标准过滤（与DVS数据集保持一致）")
+    
+    # 为每个类别创建输出目录（跳过Faces类）
+    print(f"\n创建类别目录...")
+    for category in categories:
+        if category.lower() == 'faces':
+            print(f"  跳过Faces类（N-Caltech101标准）")
+            continue
+        category_dir = os.path.join(output_dir, category)
+        os.makedirs(category_dir, exist_ok=True)
+    
+    # 统计每个类别的样本数
+    category_counts = {cat: 0 for cat in categories if cat.lower() != 'faces'}
     
     # 处理每个样本
     print(f"\n开始转换 RGB -> Edge...")
+    skipped_faces_count = 0
     
     for idx in tqdm(range(len(dataset)), desc="处理中", ncols=100):
         try:
             # 加载RGB图像和标签
             img, label = dataset[idx]
             
+            # 获取类别名称
+            if use_caltech101:
+                category_name = categories[label]
+            else:
+                category_name = categories[label]
+            
+            # N-Caltech101标准：跳过Faces类
+            if category_name.lower() == 'faces':
+                skipped_faces_count += 1
+                continue
+            
             # 转换为边缘图
             edge = sobel_edge_extraction(img)  # (2, H, W)
             
-            # 保存为.pt文件
-            output_path = os.path.join(output_dir, f"{idx}.pt")
+            # 保存为.pt文件（按类别组织）
+            category_dir = os.path.join(output_dir, category_name)
+            sample_idx = category_counts[category_name]
+            output_path = os.path.join(category_dir, f"{sample_idx}.pt")
             torch.save((edge, torch.tensor(label)), output_path)
+            
+            # 更新计数
+            category_counts[category_name] += 1
             
         except Exception as e:
             print(f"\n警告: 处理样本 {idx} 时出错: {e}")
             continue
     
+    if skipped_faces_count > 0:
+        print(f"\n✓ 已跳过Faces类 {skipped_faces_count} 个样本（N-Caltech101标准）")
+    
     print(f"\n✓ 转换完成！")
     print(f"  输出目录: {output_dir}")
-    print(f"  生成文件数: {len(os.listdir(output_dir))}")
+    
+    # 统计信息
+    total_files = sum(category_counts.values())
+    print(f"  生成文件总数: {total_files}")
+    print(f"\n各类别样本数:")
+    for category, count in sorted(category_counts.items()):
+        if count > 0:
+            print(f"    {category}: {count}")
     
     # 验证生成的数据
     print(f"\n验证生成的数据...")
-    test_file = os.path.join(output_dir, "0.pt")
+    first_category = categories[0]
+    test_file = os.path.join(output_dir, first_category, "0.pt")
     if os.path.exists(test_file):
         data, label = torch.load(test_file)
-        print(f"  样本0:")
+        print(f"  样本 ({first_category}/0.pt):")
         print(f"    边缘图形状: {data.shape}")
         print(f"    数据类型: {data.dtype}")
         print(f"    数据范围: [{data.min():.3f}, {data.max():.3f}]")

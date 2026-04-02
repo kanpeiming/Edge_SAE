@@ -84,6 +84,18 @@ class AlignmentTLTrainerWithDVSWeight:
             for i, ((source_data, target_data), labels) in pbar:
                 self.optimizer.zero_grad()
 
+                # 调试信息：打印数据形状（仅第一个batch）
+                if epoch == 0 and i == 0:
+                    print(f"\n[调试] 原始数据:")
+                    print(f"  source_data shape: {source_data.shape}, range: [{source_data.min():.3f}, {source_data.max():.3f}]")
+                    print(f"  target_data shape: {target_data.shape}, range: [{target_data.min():.3f}, {target_data.max():.3f}]")
+                    print(f"  labels shape: {labels.shape}, range: [{labels.min()}, {labels.max()}]")
+                    
+                    # 检查DVS数据的稀疏性
+                    dvs_nonzero = (target_data != 0).sum().item()
+                    dvs_total = target_data.numel()
+                    print(f"  DVS稀疏性: {dvs_nonzero}/{dvs_total} ({100*dvs_nonzero/dvs_total:.2f}% 非零)")
+
                 # 应用灰度转换（如果启用）
                 if hasattr(self.args, 'use_grayscale') and self.args.use_grayscale and source_data.shape[1] == 3:
                     source_data = self.rgb_to_grayscale_3channel(source_data)
@@ -91,8 +103,24 @@ class AlignmentTLTrainerWithDVSWeight:
                 # 编码处理
                 if source_data.shape[1] == 3:  # (N, 3, H, W) -> (N, T, 3, H, W)
                     source_data = self.encoder_dict[self.args.encoder_type](source_data)
+                    if epoch == 0 and i == 0:
+                        print(f"[调试] RGB编码后 shape: {source_data.shape}, range: [{source_data.min():.3f}, {source_data.max():.3f}]")
+                
                 if target_data.shape[1] == 3:  # (N, 3, H, W) -> (N, T, 3, H, W)
                     target_data = self.encoder_dict[self.args.encoder_type](target_data)
+                
+                # DVS数据归一化：将事件计数归一化
+                # DVS数据格式: (B, T, 2, H, W)
+                if len(target_data.shape) == 5 and target_data.shape[2] == 2:
+                    # 使用全局归一化策略，类似于RGB的归一化
+                    # 统计当前batch的最大值作为归一化因子
+                    max_val = target_data.max()
+                    if max_val > 0:
+                        # 归一化到[0, 1]范围，类似RGB数据
+                        target_data = target_data / max_val
+                    
+                    if epoch == 0 and i == 0:
+                        print(f"[调试] DVS归一化后 shape: {target_data.shape}, range: [{target_data.min():.3f}, {target_data.max():.3f}]")
 
                 source_data, labels = source_data.to(self.device), labels.to(self.device)
                 target_data, labels = target_data.to(self.device), labels.to(self.device)

@@ -19,8 +19,8 @@ class VGGSNN(nn.Module):
     def __init__(self, cls_num=10, img_shape=48, device='cuda'):
         super(VGGSNN, self).__init__()
         pool = SeqToANNContainer(nn.AvgPool2d(2))
-        self.rgb_input = Layer(3, 64, 3, 1, 1, True)
-        self.dvs_input = Layer(2, 64, 3, 1, 1, True)  # DVS 2通道输入
+        self.rgb_input = Layer(3, 64, 3, 1, 1, True)  # RGB 3通道输入
+        self.dvs_input = Layer(2, 64, 3, 1, 1, True)  # DVS/Edge 2通道输入
 
         self.features = nn.Sequential(
             Layer(64, 128, 3, 1, 1, False),
@@ -48,7 +48,7 @@ class VGGSNN(nn.Module):
     def forward(self, source, target, encoder_tl_loss_type='TCKA', feature_tl_loss_type='MSE'):
         """
         Args:
-            source: 源域输入，(N, T, 3, H, W) 为RGB图像
+            source: 源域输入，(N, T, C, H, W) C可以是3（RGB）或2（Edge）
             target: 目标域输入，(N, T, 2, H, W) 为DVS数据
             encoder_tl_loss_type: 包括 'TCKA'(分别计算各时间步mem的CKA，最后求平均), 'CKA'(将各时间步的spike求频率后计算CKA)
             feature_tl_loss_type: 包括 'TCKA', 'CKA', 'TMSE', 'MSE', 'TMMD', 'MMD'.
@@ -63,11 +63,20 @@ class VGGSNN(nn.Module):
         if self.training:
             batch_size, T = source.shape[0:2]
 
-            # 处理 RGB 输入 (3通道)
-            source, source_mem = self.rgb_input(source)
+            # 根据通道数选择输入层
+            # 处理源域输入 (3通道RGB 或 2通道Edge)
+            if source.shape[2] == 3:
+                source, source_mem = self.rgb_input(source)
+            elif source.shape[2] == 2:
+                source, source_mem = self.dvs_input(source)
+            else:
+                raise ValueError(f"Unexpected source channel number: {source.shape[2]}, expected 2 or 3")
             
-            # 处理 DVS 输入 (2通道)
-            target, target_mem = self.dvs_input(target)
+            # 处理目标域输入 (2通道DVS)
+            if target.shape[2] == 2:
+                target, target_mem = self.dvs_input(target)
+            else:
+                raise ValueError(f"Unexpected target channel number: {target.shape[2]}, expected 2")
 
             # 计算编码器迁移损失
             if encoder_tl_loss_type == 'TCKA':
@@ -137,8 +146,8 @@ class VGGSNNwoAP(VGGSNN):
         - 这与tl.py的实现完全一致
         """
         super(VGGSNNwoAP, self).__init__(cls_num=cls_num, img_shape=img_shape, device='cuda')
-        self.rgb_input = Layer(3, 64, 3, 1, 1, True)  # 保持True以记录mem
-        self.dvs_input = Layer(2, 64, 3, 1, 1, True)  # 保持True以记录mem
+        self.rgb_input = Layer(3, 64, 3, 1, 1, True)  # RGB 3通道输入
+        self.dvs_input = Layer(2, 64, 3, 1, 1, True)  # DVS/Edge 2通道输入
         self.features = nn.Sequential(
             Layer(64, 128, 3, 2, 1, False),
             Layer(128, 256, 3, 1, 1, False),
