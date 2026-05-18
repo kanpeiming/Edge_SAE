@@ -74,6 +74,11 @@ parser.add_argument('--edge_root', type=str,
 parser.add_argument('--dvs_root', type=str,
                     default='',
                     help='DVS data root directory')
+# 事件注意力参数
+parser.add_argument('--use_event_attention', action='store_true', default=False,
+                    help='Enable event mid-frame guided attention for DVS branch')
+parser.add_argument('--event_attention_reduction', type=int, default=8,
+                    help='Channel reduction ratio for event attention (default: 8)')
 
 args = parser.parse_args()
 
@@ -123,7 +128,8 @@ log_name = (
     f"seed{args.seed}_"
     f"Edge{args.edge_sample_ratio}_"
     f"DVS{args.dvs_sample_ratio}_"
-    f"img{args.img_size}"
+    f"img{args.img_size}_"
+    f"{'EventAttn' if args.use_event_attention else 'NoAttn'}"
 )
 
 log_dir = os.path.join(args.log_dir, f"Edge2DVS_{args.data_set}_{args.num_classes}", log_name)
@@ -211,11 +217,24 @@ if __name__ == "__main__":
     
     # 准备模型
     if args.use_woap:
-        model = VGGSNNwoAP(cls_num=args.num_classes, img_shape=args.img_size)
+        model = VGGSNNwoAP(cls_num=args.num_classes, img_shape=args.img_size,
+                          use_event_attention=args.use_event_attention,
+                          event_attention_reduction=args.event_attention_reduction)
         print("使用VGGSNNwoAP模型")
     else:
-        model = VGGSNN(cls_num=args.num_classes, img_shape=args.img_size, device=device)
+        model = VGGSNN(cls_num=args.num_classes, img_shape=args.img_size, device=device,
+                      use_event_attention=args.use_event_attention,
+                      event_attention_reduction=args.event_attention_reduction)
         print("使用标准VGGSNN模型")
+    
+    # 打印事件注意力配置
+    if args.use_event_attention:
+        print(f"✓ 事件注意力已启用:")
+        print(f"  - 中间稳定帧引导的时序注意力")
+        print(f"  - 插入位置: dvs_input后 + features[0]后")
+        print(f"  - 通道压缩比: {args.event_attention_reduction}")
+    else:
+        print("✗ 事件注意力未启用（使用标准训练）")
     
     # 加载预训练参数（参考baseline.py的方式）
     if args.pretrained_path and os.path.exists(args.pretrained_path):

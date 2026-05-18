@@ -46,6 +46,7 @@ python preprocess_bin_to_pt.py --bin_root /path/to/bin/data --pt_output /path/to
 - T: SNN时间步数 (默认10)
 - size: 输入图像尺寸 (默认48)
 - dvs_sample_ratio: 训练集使用比例 (默认1.0)
+- val_split: 验证集划分比例 (默认0.0，即不从训练集中拆分，直接使用测试集作为验证集)
 - pretrained_path: 预训练模型路径
 - load_features: 是否加载features模块 (Conv层)
 - load_bottleneck: 是否加载bottleneck层
@@ -57,6 +58,7 @@ python preprocess_bin_to_pt.py --bin_root /path/to/bin/data --pt_output /path/to
 - 传统数据增强（随机翻转、平移）
 - 101类别分类头
 - 支持预训练模型加载
+- 使用测试集作为每轮验证集选择最佳模型，训练集使用全量数据
 - 简洁的训练脚本结构
 """
 
@@ -72,10 +74,10 @@ from models.snn_models.VGG import VGGSNN, VGGSNNwoAP
 from torch.utils.tensorboard import SummaryWriter
 
 parser = argparse.ArgumentParser(description='PyTorch Temporal Efficient Training for N-Caltech101')
-parser.add_argument('--batch_size', default=32, type=int, help='Batchsize')
+parser.add_argument('--batch_size', default=16, type=int, help='Batchsize')
 parser.add_argument('--lr', default=0.001, type=float, help='Learning rate')
 parser.add_argument('--weight_decay', default=5e-4, type=float, help='Weight decay')
-parser.add_argument('--epoch', default=100, type=int, help='Training epochs')
+parser.add_argument('--epoch', default=50, type=int, help='Training epochs')
 parser.add_argument('--id', default='caltech101_baseline', type=str, help='Model identifier')
 parser.add_argument('--device', default='cuda', type=str, help='cuda or cpu')
 parser.add_argument('--parallel', default=False, type=bool, help='Whether to use multi-GPU parallelism')
@@ -105,6 +107,14 @@ parser.add_argument('--load_classifier', action='store_true', default=False,
                     help='Whether to load classifier related parameters from pretrained model (default: False)')
 parser.add_argument('--num_workers', type=int, default=8,
                     help='Number of data loading workers (default: 4, use 0 for Windows if encountering issues)')
+# 事件注意力参数
+parser.add_argument('--use_event_attention', action='store_true', default=False,
+                    help='Enable event mid-frame guided attention for DVS data')
+parser.add_argument('--event_attention_reduction', type=int, default=8,
+                    help='Channel reduction ratio for event attention (default: 8)')
+# 验证集划分参数
+parser.add_argument('--val_split', type=float, default=0.0,
+                    help='Validation set split ratio from training set (default: 0.0, i.e., use test set as validation)')
 args = parser.parse_args()
 
 # 添加缺失的data_set属性（trainer需要用到）
@@ -114,7 +124,8 @@ args.data_set = 'Caltech101'
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 # 日志名称
-log_name = f"FT_{args.fine_tuning}_NCaltech101_baseline_lr{args.lr}_T{args.T}_bs{args.batch_size}_seed{args.seed}_imageSize{args.size}"
+attn_tag = "_EventAttn" if args.use_event_attention else ""
+log_name = f"FT_{args.fine_tuning}_NCaltech101_baseline_lr{args.lr}_T{args.T}_bs{args.batch_size}_seed{args.seed}_imageSize{args.size}{attn_tag}"
 
 # 创建日志和检查点目录
 os.makedirs(args.log_dir, exist_ok=True)
@@ -138,8 +149,9 @@ if __name__ == "__main__":
     print("Using traditional augmentation:")
     print("  - Horizontal flip: 50% probability")
     print("  - Random translation")
+    print("Validation strategy: using test set as validation (no split from training set)")
     
-    train_loader, test_loader = create_caltech101_dataloaders(
+    train_loader, _, test_loader = create_caltech101_dataloaders(
         data_path=args.caltech101_dvs_path,
         batch_size=args.batch_size,
         train_ratio=args.dvs_sample_ratio,
@@ -147,12 +159,27 @@ if __name__ == "__main__":
         img_size=args.size,
         use_nda=False,
         use_eventrpg=False,
-        eventrpg_mix_prob=0.5
+        eventrpg_mix_prob=0.5,
+        val_split=0.0
     )
+    # 用测试集充当每轮 epoch 的验证集，训练集使用全量数据
+    val_loader = test_loader
 
     # 准备模型 - N-Caltech101有101个类别
     print("Initializing VGGSNN model for N-Caltech101...")
-    model = VGGSNN(2, 101, args.size)  # N-Caltech101: (2, 101, size)
+    model = VGGSNN(2, 101, args.size, 
+                   use_event_attention=args.use_event_attention,
+                   event_attention_reduction=args.event_attention_reduction)
+    
+    # 打印事件注意力配置
+    if args.use_event_attention:
+        print(f"✓ 事件注意力已启用:")
+        print(f"  - 中间稳定帧引导的时序注意力")
+        print(f"  - 插入位置: dvs_input后 + features[0]后")
+        print(f"  - 通道压缩比: {args.event_attention_reduction}")
+        print(f"  - 仅作用于DVS数据（Baseline训练）")
+    else:
+        print("✗ 事件注意力未启用（使用标准Baseline训练）")
     
     if args.parallel and torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs for training")
@@ -240,13 +267,13 @@ if __name__ == "__main__":
     print(f"\n使用TET (Temporal Efficient Training) Loss")
     criterion = TET_loss
 
-    # 使用BaselineTrainer（不使用验证集，只在训练集上训练）
+    # 使用BaselineTrainer（使用验证集选择最佳模型）
     trainer = BaselineTrainer(args, device, writer, model, optimizer, criterion, scheduler, model_path)
     
-    print("\n注意：使用BaselineTrainer - 训练过程中不使用验证集，仅在最后使用测试集评估")
+    print("\n注意：使用BaselineTrainer - 训练过程中使用【测试集】作为验证集选择最佳模型")
     print("=" * 80)
     
-    best_train_acc = trainer.train(train_loader)
+    best_val_acc = trainer.train(train_loader, val_loader)
     
     print("\n" + "=" * 80)
     print("训练完成！开始在测试集上进行最终评估...")
@@ -266,12 +293,14 @@ if __name__ == "__main__":
     print(f'\n最终测试结果:')
     print(f'  Loss: {test_loss:.5f}')
     print(f'  Accuracy: {test_acc:.5f} ({test_acc*100:.2f}%)')
-    print(f'  最佳训练准确率: {best_train_acc:.5f} ({best_train_acc*100:.2f}%)')
+    print(f'  最佳训练准确率: {trainer.best_train_acc:.5f} ({trainer.best_train_acc*100:.2f}%)')
+    print(f'  最佳验证准确率: {best_val_acc:.5f} ({best_val_acc*100:.2f}%)')
     
     # 记录最终测试结果
     writer.add_scalar(tag="final_test/accuracy", scalar_value=test_acc, global_step=0)
     writer.add_scalar(tag="final_test/loss", scalar_value=test_loss, global_step=0)
-    writer.add_scalar(tag="final_test/train_accuracy", scalar_value=best_train_acc, global_step=0)
+    writer.add_scalar(tag="final_test/train_accuracy", scalar_value=trainer.best_train_acc, global_step=0)
+    writer.add_scalar(tag="final_test/val_accuracy", scalar_value=best_val_acc, global_step=0)
     
     writer.close()
     print(f"Training completed. Model saved to: {model_path}")

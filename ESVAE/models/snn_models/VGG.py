@@ -11,10 +11,19 @@ from ..TET__layer import *
 
 
 class VGGSNN(nn.Module):
-    def __init__(self, in_channel=2, cls_num=10, img_shape=32):
+    def __init__(self, in_channel=2, cls_num=10, img_shape=32, use_event_attention=False, event_attention_reduction=8):
         super(VGGSNN, self).__init__()
         pool = SeqToANNContainer(nn.AvgPool2d(2))
         self.dvs_input = Layer(2, 64, 3, 1, 1)
+        
+        # 事件注意力开关
+        self.use_event_attention = use_event_attention
+        
+        # 如果启用事件注意力，在前两层添加注意力模块
+        if self.use_event_attention:
+            self.event_attn_1 = EventMidFrameAttention(64, reduction=event_attention_reduction)  # dvs_input后
+            self.event_attn_2 = EventMidFrameAttention(128, reduction=event_attention_reduction)  # features[0]后
+
         self.features = nn.Sequential(
             Layer(64, 128, 3, 1, 1),
             pool,
@@ -40,7 +49,22 @@ class VGGSNN(nn.Module):
     def forward(self, input):
         # input = add_dimention(input, self.T)
         x = self.dvs_input(input)
-        x = self.features(x)
+
+        # 【新增】第1处事件注意力：dvs_input 之后
+        if self.use_event_attention:
+            x = self.event_attn_1(x)
+
+        # features第一层
+        x = self.features[0](x)  # Layer(64, 128, ...)
+
+        # 【新增】第2处事件注意力：features[0] 之后
+        if self.use_event_attention:
+            x = self.event_attn_2(x)
+
+        # 继续后续层
+        for layer in self.features[1:]:
+            x = layer(x)
+
         x = torch.flatten(x, 2)
         x = self.bottleneck(x)
         x = self.classifier(x)

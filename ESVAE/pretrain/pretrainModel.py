@@ -16,11 +16,20 @@ from models.TET__layer import *
 
 
 class VGGSNN(nn.Module):
-    def __init__(self, cls_num=10, img_shape=48, device='cuda'):
+    def __init__(self, cls_num=10, img_shape=48, device='cuda', use_event_attention=False, event_attention_reduction=8):
         super(VGGSNN, self).__init__()
         pool = SeqToANNContainer(nn.AvgPool2d(2))
         self.rgb_input = Layer(3, 64, 3, 1, 1, True)  # RGB 3通道输入
         self.dvs_input = Layer(2, 64, 3, 1, 1, True)  # DVS/Edge 2通道输入
+        
+        # 事件注意力开关
+        self.use_event_attention = use_event_attention
+        
+        # 如果启用事件注意力，在前两层添加注意力模块
+        if self.use_event_attention:
+            from models.TET__layer import EventMidFrameAttention
+            self.event_attn_1 = EventMidFrameAttention(64, reduction=event_attention_reduction)  # dvs_input后
+            self.event_attn_2 = EventMidFrameAttention(128, reduction=event_attention_reduction)  # features[0]后
 
         self.features = nn.Sequential(
             Layer(64, 128, 3, 1, 1, False),
@@ -77,6 +86,10 @@ class VGGSNN(nn.Module):
                 target, target_mem = self.dvs_input(target)
             else:
                 raise ValueError(f"Unexpected target channel number: {target.shape[2]}, expected 2")
+            
+            # 【新增】第1处事件注意力：dvs_input 之后
+            if self.use_event_attention:
+                target = self.event_attn_1(target)
 
             # 计算编码器迁移损失
             if encoder_tl_loss_type == 'TCKA':
@@ -89,13 +102,24 @@ class VGGSNN(nn.Module):
                 raise Exception(f"Invalid encoder_tl_loss_type: {encoder_tl_loss_type}")
 
             # 提取高层特征
+            # Source分支正常走
             source = self.features(source)
             source = torch.flatten(source, 2)
             source = self.bottleneck(source)
             source, source_mem = self.bottleneck_lif_node(source, return_mem=True)
             source_clf = self.classifier(source)
 
-            target = self.features(target)
+            # Target(DVS)分支：在features第一层后添加第2处注意力
+            target = self.features[0](target)  # Layer(64, 128, ...)
+            
+            # 【新增】第2处事件注意力：features[0] 之后
+            if self.use_event_attention:
+                target = self.event_attn_2(target)
+            
+            # 继续后续层
+            for layer in self.features[1:]:
+                target = layer(target)
+            
             target = torch.flatten(target, 2)
             target = self.bottleneck(target)
             target, target_mem = self.bottleneck_lif_node(target, return_mem=True)
@@ -123,7 +147,22 @@ class VGGSNN(nn.Module):
                 target, _ = self.rgb_input(target)
             else:
                 target, _ = self.dvs_input(target)
-            target = self.features(target)
+            
+            # 【新增】测试时也要走相同的事件注意力路径
+            if self.use_event_attention:
+                target = self.event_attn_1(target)
+            
+            # features第一层
+            target = self.features[0](target)
+            
+            # 【新增】第2处注意力
+            if self.use_event_attention:
+                target = self.event_attn_2(target)
+            
+            # 继续后续层
+            for layer in self.features[1:]:
+                target = layer(target)
+            
             target = torch.flatten(target, 2)
             target = self.bottleneck(target)
             target = self.bottleneck_lif_node(target)
@@ -132,20 +171,24 @@ class VGGSNN(nn.Module):
 
 
 class VGGSNNwoAP(VGGSNN):
-    def __init__(self, cls_num=10, img_shape=32):
+    def __init__(self, cls_num=10, img_shape=32, use_event_attention=False, event_attention_reduction=8):
         """
         VGGSNNwoAP: 使用stride=2卷积替代平均池化
         
         Args:
             cls_num: 分类数量，默认10（CIFAR10）
             img_shape: 输入图像大小，默认32（与tl.py保持一致，CIFAR10使用32×32）
+            use_event_attention: 是否启用事件注意力
+            event_attention_reduction: 事件注意力通道压缩比
         
         注意：完全复制tl.py的bottleneck设计
         - bottleneck包含Linear+LIFSpike
         - bottleneck_lif_node继承自父类（会导致两次LIFSpike激活）
         - 这与tl.py的实现完全一致
         """
-        super(VGGSNNwoAP, self).__init__(cls_num=cls_num, img_shape=img_shape, device='cuda')
+        super(VGGSNNwoAP, self).__init__(cls_num=cls_num, img_shape=img_shape, device='cuda',
+                                         use_event_attention=use_event_attention,
+                                         event_attention_reduction=event_attention_reduction)
         self.rgb_input = Layer(3, 64, 3, 1, 1, True)  # RGB 3通道输入
         self.dvs_input = Layer(2, 64, 3, 1, 1, True)  # DVS/Edge 2通道输入
         self.features = nn.Sequential(

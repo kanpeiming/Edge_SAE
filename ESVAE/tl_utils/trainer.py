@@ -176,21 +176,22 @@ class BaselineTrainer(Trainer):
     Baseline训练器：专门用于baseline实验
     
     与标准Trainer的区别：
-    1. 不使用验证集（只用训练集和测试集）
-    2. 训练过程中不在测试集上评估（避免信息泄露）
-    3. 只在训练结束后进行最终测试
-    4. 基于训练集准确率保存最佳模型
+    1. 使用验证集来选择最佳模型（而不是训练集准确率）
+    2. 训练过程中在验证集上评估
+    3. 基于验证集准确率保存最佳模型
+    4. 测试集仅用于最终评估
     """
     def __init__(self, args, device, writer, network, optimizer, criterion, scheduler, model_path):
         super(BaselineTrainer, self).__init__(args, device, writer, network, optimizer, criterion, scheduler, model_path)
         self.best_train_acc = 0
 
-    def train(self, train_loader, test_loader=None):
+    def train(self, train_loader, val_loader, test_loader=None):
         """
         Baseline训练方法
         
         Args:
             train_loader: 训练数据加载器
+            val_loader: 验证数据加载器
             test_loader: 测试数据加载器（可选，仅用于最终评估）
         """
         for epoch in range(self.args.epoch):
@@ -241,19 +242,31 @@ class BaselineTrainer(Trainer):
             print(f'Epoch:[{epoch}/{self.args.epoch}]\t time cost: {time_cost:.2f}min\t '
                   f'train_loss={train_loss:.5f}\t train_acc={train_acc:.3f}')
 
-            # 记录训练指标
+            # 在验证集上评估
+            val_loss, val_acc = self.test(val_loader)
+            print(f'Epoch:[{epoch}/{self.args.epoch}]\t val_loss={val_loss:.5f}\t val_acc={val_acc:.3f}')
+
+            # 记录训练和验证指标
             self.writer.add_scalar(tag="train/accuracy", scalar_value=train_acc, global_step=epoch)
             self.writer.add_scalar(tag="train/lr", scalar_value=self.optimizer.param_groups[0]['lr'], global_step=epoch)
             self.writer.add_scalar(tag="train/loss", scalar_value=train_loss, global_step=epoch)
+            self.writer.add_scalar(tag="val/accuracy", scalar_value=val_acc, global_step=epoch)
+            self.writer.add_scalar(tag="val/loss", scalar_value=val_loss, global_step=epoch)
 
-            # 保存最佳模型（基于训练集准确率）
+            # 更新最佳训练准确率
             if self.best_train_acc < train_acc:
                 self.best_train_acc = train_acc
-                self.save_model(epoch)
-                print(f'Saving.. Best train acc: {self.best_train_acc:.3f}')
 
-        print(f"\n训练完成！最佳训练准确率: {self.best_train_acc:.3f}")
-        return self.best_train_acc
+            # 保存最佳模型（基于验证集准确率）
+            if self.best_val_acc < val_acc:
+                self.best_val_acc = val_acc
+                self.save_model(epoch)
+                print(f'Saving.. Best val acc: {self.best_val_acc:.3f}')
+
+            print(f"Best train acc: {self.best_train_acc:.3f}, Best val acc: {self.best_val_acc:.3f}")
+
+        print(f"\n训练完成！最佳训练准确率: {self.best_train_acc:.3f}, 最佳验证准确率: {self.best_val_acc:.3f}")
+        return self.best_val_acc
 
 
 class TLTrainer(Trainer):

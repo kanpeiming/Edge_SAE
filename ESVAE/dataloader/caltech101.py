@@ -983,8 +983,8 @@ class NCaltech101Dataset(Dataset):
     优化的N-Caltech101数据集类
     支持灵活的文件命名格式和数据增强
     """
-    def __init__(self, root, transform=True, img_size=224, use_nda=False, use_eventrpg=False, eventrpg_mix_prob=0.5, 
-                 filter_faces=False):
+    def __init__(self, root, transform=True, img_size=224, use_nda=False, use_eventrpg=False, eventrpg_mix_prob=0.5,
+                 filter_faces=False, verbose=True):
         """
         Args:
             root: 数据根目录
@@ -1001,13 +1001,15 @@ class NCaltech101Dataset(Dataset):
         self.use_nda = use_nda
         self.use_eventrpg = use_eventrpg
         self.filter_faces = filter_faces
+        self.verbose = verbose
         self.resize = transforms.Resize(size=(img_size, img_size))
         self.to_tensor = transforms.ToTensor()
         self.to_pil = transforms.ToPILImage()
         
         # 构建文件列表并排序
         self.files = self._build_file_list()
-        print(f"Loaded {len(self.files)} samples from {root}")
+        if self.verbose:
+            print(f"Loaded {len(self.files)} samples from {root}")
         
         # 初始化NDA增强器
         if self.use_nda:
@@ -1029,14 +1031,15 @@ class NCaltech101Dataset(Dataset):
         
         if subdirs:
             # 类别目录结构：遍历所有类别目录
-            print(f"检测到类别目录结构，共 {len(subdirs)} 个类别")
+            if self.verbose:
+                print(f"检测到类别目录结构，共 {len(subdirs)} 个类别")
             
             # 如果需要过滤Faces类
             if self.filter_faces:
                 original_count = len(subdirs)
                 subdirs = [d for d in subdirs if d.lower() not in ['faces', 'faces_easy']]
                 filtered_count = original_count - len(subdirs)
-                if filtered_count > 0:
+                if filtered_count > 0 and self.verbose:
                     print(f"  过滤掉 {filtered_count} 个Faces类（N-Caltech101标准）")
             
             files = []
@@ -1058,8 +1061,9 @@ class NCaltech101Dataset(Dataset):
                     files.append(os.path.join(category_dir, f))
                     self.file_labels.append(label_idx)
             
-            print(f"从类别目录加载了 {len(files)} 个文件")
-            if self.filter_faces and self.file_labels:
+            if self.verbose:
+                print(f"从类别目录加载了 {len(files)} 个文件")
+            if self.filter_faces and self.file_labels and self.verbose:
                 print(f"  标签范围: [0, {max(self.file_labels)}]，共 {len(set(self.file_labels))} 个类别")
             return files
         else:
@@ -1302,7 +1306,7 @@ class NCaltech101Dataset(Dataset):
         return len(self.files)
 
 
-def create_caltech101_dataloaders(data_path, batch_size, train_ratio=1.0, num_workers=8, img_size=224, use_nda=False, use_eventrpg=False, eventrpg_mix_prob=0.5, split_ratio=0.9):
+def create_caltech101_dataloaders(data_path, batch_size, train_ratio=1.0, num_workers=8, img_size=224, use_nda=False, use_eventrpg=False, eventrpg_mix_prob=0.5, split_ratio=0.9, val_split=0.1):
     """
     创建N-Caltech101数据加载器
     
@@ -1316,9 +1320,10 @@ def create_caltech101_dataloaders(data_path, batch_size, train_ratio=1.0, num_wo
         use_eventrpg: 是否使用EventRPG的数据增强方法
         eventrpg_mix_prob: EventRPG的RPGMix概率
         split_ratio: 当没有train/test划分时，自动划分的训练集比例（默认0.9）
+        val_split: 从训练集中划分出验证集的比例（默认0.1，即10%作为验证集）
     
     Returns:
-        train_loader, test_loader
+        train_loader, val_loader, test_loader
     """
     import random
     from torch.utils.data.sampler import SubsetRandomSampler
@@ -1331,22 +1336,44 @@ def create_caltech101_dataloaders(data_path, batch_size, train_ratio=1.0, num_wo
     
     if has_split:
         # 使用预先划分的train/test
-        train_dataset = NCaltech101Dataset(train_path, transform=True, img_size=img_size, use_nda=use_nda, use_eventrpg=use_eventrpg, eventrpg_mix_prob=eventrpg_mix_prob)
-        test_dataset = NCaltech101Dataset(test_path, transform=False, img_size=img_size, use_nda=False, use_eventrpg=False)
+        full_train_dataset = NCaltech101Dataset(
+            train_path, transform=True, img_size=img_size, use_nda=use_nda,
+            use_eventrpg=use_eventrpg, eventrpg_mix_prob=eventrpg_mix_prob, verbose=True
+        )
+        val_dataset = NCaltech101Dataset(
+            train_path, transform=False, img_size=img_size, use_nda=False,
+            use_eventrpg=False, verbose=False
+        )
+        test_dataset = NCaltech101Dataset(
+            test_path, transform=False, img_size=img_size, use_nda=False,
+            use_eventrpg=False, verbose=False
+        )
         
-        print(f"Dataset loaded: {len(train_dataset)} train, {len(test_dataset)} test samples")
+        print(f"Dataset loaded: {len(full_train_dataset)} train+val, {len(test_dataset)} test samples")
         
-        # 训练集采样
+        # 从训练集中划分出训练集和验证集
+        n_total = len(full_train_dataset)
+        indices = list(range(n_total))
+        random.shuffle(indices)
+        
+        # 应用train_ratio
         if train_ratio < 1.0:
-            n_train = len(train_dataset)
-            indices = list(range(n_train))
-            random.shuffle(indices)
-            train_indices = indices[:int(n_train * train_ratio)]
-            train_sampler = SubsetRandomSampler(train_indices)
-            shuffle = False
-        else:
-            train_sampler = None
-            shuffle = True
+            n_use = int(n_total * train_ratio)
+            indices = indices[:n_use]
+        
+        # 划分训练集和验证集
+        n_val = int(len(indices) * val_split)
+        val_indices = indices[:n_val]
+        train_indices = indices[n_val:]
+        
+        print(
+            f"Split: {len(train_indices)} train, {len(val_indices)} val "
+            f"({val_split:.1%} of selected train data), {len(test_dataset)} test samples"
+        )
+        
+        train_sampler = SubsetRandomSampler(train_indices)
+        val_sampler = SubsetRandomSampler(val_indices)
+        shuffle = False
         
         test_sampler = None
     else:
@@ -1354,7 +1381,10 @@ def create_caltech101_dataloaders(data_path, batch_size, train_ratio=1.0, num_wo
         print(f"No train/test split found, auto-splitting with ratio {split_ratio}")
         
         # 加载整个数据集
-        full_dataset = NCaltech101Dataset(data_path, transform=False, img_size=img_size, use_nda=False, use_eventrpg=False)
+        full_dataset = NCaltech101Dataset(
+            data_path, transform=False, img_size=img_size, use_nda=False,
+            use_eventrpg=False, verbose=True
+        )
         
         # 按类别划分
         if hasattr(full_dataset, 'file_labels') and full_dataset.file_labels is not None:
@@ -1363,44 +1393,63 @@ def create_caltech101_dataloaders(data_path, batch_size, train_ratio=1.0, num_wo
             for idx, label in enumerate(full_dataset.file_labels):
                 samples_by_class[label].append(idx)
             
-            train_indices = []
+            train_val_indices = []
             test_indices = []
             
             for label, indices in samples_by_class.items():
                 random.shuffle(indices)
                 split_point = int(len(indices) * split_ratio)
-                train_indices.extend(indices[:split_point])
+                train_val_indices.extend(indices[:split_point])
                 test_indices.extend(indices[split_point:])
             
-            random.shuffle(train_indices)
+            random.shuffle(train_val_indices)
             random.shuffle(test_indices)
         else:
             # 没有类别信息，按顺序划分
             all_indices = list(range(len(full_dataset)))
             random.shuffle(all_indices)
             split_point = int(len(all_indices) * split_ratio)
-            train_indices = all_indices[:split_point]
+            train_val_indices = all_indices[:split_point]
             test_indices = all_indices[split_point:]
         
-        print(f"Dataset loaded: {len(train_indices)} train, {len(test_indices)} test samples")
-        
-        # 创建带数据增强的训练集和不带数据增强的测试集
-        train_dataset = NCaltech101Dataset(data_path, transform=True, img_size=img_size, use_nda=use_nda, use_eventrpg=use_eventrpg, eventrpg_mix_prob=eventrpg_mix_prob)
-        test_dataset = NCaltech101Dataset(data_path, transform=False, img_size=img_size, use_nda=False, use_eventrpg=False)
-        
-        # 使用采样器
+        # 应用train_ratio
         if train_ratio < 1.0:
-            n_use = int(len(train_indices) * train_ratio)
-            train_indices = train_indices[:n_use]
+            n_use = int(len(train_val_indices) * train_ratio)
+            train_val_indices = train_val_indices[:n_use]
+        
+        # 从train_val中划分出训练集和验证集
+        n_val = int(len(train_val_indices) * val_split)
+        val_indices = train_val_indices[:n_val]
+        train_indices = train_val_indices[n_val:]
+        
+        print(
+            f"Split: {len(train_indices)} train, {len(val_indices)} val "
+            f"({val_split:.1%} of selected train data), {len(test_indices)} test samples"
+        )
+        
+        # 创建带数据增强的训练集和不带数据增强的验证/测试集
+        train_dataset = NCaltech101Dataset(
+            data_path, transform=True, img_size=img_size, use_nda=use_nda,
+            use_eventrpg=use_eventrpg, eventrpg_mix_prob=eventrpg_mix_prob, verbose=False
+        )
+        val_dataset = NCaltech101Dataset(
+            data_path, transform=False, img_size=img_size, use_nda=False,
+            use_eventrpg=False, verbose=False
+        )
+        test_dataset = NCaltech101Dataset(
+            data_path, transform=False, img_size=img_size, use_nda=False,
+            use_eventrpg=False, verbose=False
+        )
         
         train_sampler = SubsetRandomSampler(train_indices)
+        val_sampler = SubsetRandomSampler(val_indices)
         test_sampler = SubsetRandomSampler(test_indices)
         shuffle = False
     
     # 创建数据加载器
     # 优化配置：添加prefetch_factor和persistent_workers以减少数据加载停顿
     train_loader = DataLoaderX(
-        train_dataset,
+        full_train_dataset if has_split else train_dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         sampler=train_sampler,
@@ -1410,6 +1459,22 @@ def create_caltech101_dataloaders(data_path, batch_size, train_ratio=1.0, num_wo
         prefetch_factor=4,  # 每个worker预取4个batch，减少等待时间
         persistent_workers=True if num_workers > 0 else False  # 保持worker进程，避免重复创建
     )
+    
+    # 若 val_indices 为空（val_split=0.0），返回 None 避免空 DataLoader 引起的 worker 问题
+    if len(val_indices) == 0:
+        val_loader = None
+    else:
+        val_loader = DataLoaderX(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            sampler=val_sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=False,
+            prefetch_factor=4,
+            persistent_workers=True if num_workers > 0 else False
+        )
     
     test_loader = DataLoaderX(
         test_dataset,
@@ -1423,7 +1488,7 @@ def create_caltech101_dataloaders(data_path, batch_size, train_ratio=1.0, num_wo
         persistent_workers=True if num_workers > 0 else False
     )
     
-    return train_loader, test_loader
+    return train_loader, val_loader, test_loader
 
 
 # ============================================================================

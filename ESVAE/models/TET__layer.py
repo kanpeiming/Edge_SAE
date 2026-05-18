@@ -184,6 +184,95 @@ class LIFSpike(nn.Module):
             return torch.stack(spike_pot, dim=1)
 
 
+class EventMidFrameAttention(nn.Module):
+    """
+    事件中间稳定帧引导的时序注意力模块
+    
+    核心思想：
+    - 取事件序列中间两帧作为稳定边缘先验（Q）
+    - 用完整事件序列构造 K 和 V
+    - 通过轻量卷积注意力增强事件表示
+    - 使用残差连接保持原有特征
+    
+    Args:
+        in_channels: 输入通道数
+        reduction: 注意力通道压缩比例，默认8
+    """
+    def __init__(self, in_channels, reduction=8):
+        super(EventMidFrameAttention, self).__init__()
+        self.in_channels = in_channels
+        
+        # 用于生成 Q/K/V 的轻量卷积
+        self.query_conv = SeqToANNContainer(nn.Conv2d(in_channels, in_channels // reduction, 1))
+        self.key_conv = SeqToANNContainer(nn.Conv2d(in_channels, in_channels // reduction, 1))
+        self.value_conv = SeqToANNContainer(nn.Conv2d(in_channels, in_channels, 1))
+        
+        # 输出投影
+        self.out_conv = SeqToANNContainer(nn.Conv2d(in_channels, in_channels, 1))
+        
+        # 残差权重（可学习）
+        self.gamma = nn.Parameter(torch.zeros(1))
+        
+        self.softmax = nn.Softmax(dim=-1)
+    
+    def forward(self, x):
+        """
+        Args:
+            x: (N, T, C, H, W) 事件特征序列
+        Returns:
+            out: (N, T, C, H, W) 增强后的事件特征
+        """
+        batch_size, T, C, H, W = x.shape
+        
+        # 取中间两帧作为稳定先验
+        t1 = T // 2 - 1
+        t2 = T // 2
+        # 处理 T < 2 的边界情况
+        if T < 2:
+            t1, t2 = 0, 0
+        elif T == 2:
+            t1, t2 = 0, 1
+        
+        # 平均中间两帧得到稳定先验 (N, 1, C, H, W)
+        stable_prior = (x[:, t1:t1+1, :, :, :] + x[:, t2:t2+1, :, :, :]) / 2.0
+        
+        # 生成 Query（来自稳定先验）
+        # (N, 1, C, H, W) -> (N, 1, C', H, W) -> (N, C', H*W)
+        Q = self.query_conv(stable_prior).squeeze(1).view(batch_size, -1, H * W)
+        
+        # 生成 Key 和 Value（来自完整序列）
+        # (N, T, C, H, W) -> (N, T, C', H, W) -> (N, T, C', H*W)
+        K = self.key_conv(x).view(batch_size, T, -1, H * W)
+        V = self.value_conv(x).view(batch_size, T, C, H * W)
+        
+        # 计算注意力权重
+        # Q: (N, C', H*W), K: (N, T, C', H*W)
+        # 对每个时间步计算相似度
+        attention_scores = []
+        for t in range(T):
+            # (N, C', H*W) @ (N, C', H*W).T -> (N, H*W, H*W)
+            score = torch.bmm(Q.transpose(1, 2), K[:, t, :, :])  # (N, H*W, H*W)
+            attention_scores.append(score)
+        
+        # (N, T, H*W, H*W)
+        attention_scores = torch.stack(attention_scores, dim=1)
+        attention_weights = self.softmax(attention_scores)
+        
+        # 应用注意力到 Value
+        # (N, T, H*W, H*W) @ (N, T, C, H*W).transpose -> (N, T, H*W, C)
+        out = torch.matmul(attention_weights, V.transpose(2, 3))  # (N, T, H*W, C)
+        out = out.transpose(2, 3).contiguous()  # (N, T, C, H*W)
+        out = out.view(batch_size, T, C, H, W)
+        
+        # 输出投影
+        out = self.out_conv(out)
+        
+        # 残差连接（可学习权重）
+        out = x + self.gamma * out
+        
+        return out
+
+
 class tdBatchNorm(nn.Module):
     def __init__(self, out_panel):
         super(tdBatchNorm, self).__init__()
